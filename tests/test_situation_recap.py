@@ -222,6 +222,22 @@ class SituationRecapTests(unittest.TestCase):
         self.assertEqual(sum(len(e['planned_fact_ids']) for e in events), 12)
         self.assertEqual(events[-1]['end_seconds'], 72)
 
+    def test_story_beat_spine_survives_situation_grouping(self):
+        outline = {'story_beats': [{
+            'beat_id': 'GB001', 'start_seconds': 0, 'end_seconds': 72,
+            'summary': 'Cả nhóm tìm một nơi ở mới.',
+            'cause': 'Không còn chỗ nào ở hiện tại.',
+            'goal': 'Tìm vùng đất chưa có người ở.',
+            'state_before': 'Cả nhóm chưa có nơi trú chân.',
+            'state_after': 'Họ đến thời tiền sử.',
+            'outcome': 'Cả nhóm bắt đầu xây nơi ở.',
+        }]}
+        plan = build_situation_plan(self.chunks(), outline, 72, 300)
+        event = plan['events_by_part'][0][0]
+        self.assertEqual(event['story_beat_cause'], 'Không còn chỗ nào ở hiện tại.')
+        self.assertEqual(event['story_beat_goal'], 'Tìm vùng đất chưa có người ở.')
+        self.assertEqual(event['story_beat_outcome'], 'Cả nhóm bắt đầu xây nơi ở.')
+
     def test_ambiguous_shot_does_not_join_two_storylines(self):
         chunks = self.chunks()
         a, b = chunks[0]['events'][:2]

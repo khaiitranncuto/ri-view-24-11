@@ -1,5 +1,8 @@
 import os
 import sys
+from process_utils import configure_utf8_console
+from process_utils import console_print as print
+configure_utf8_console()
 import threading
 import time
 import traceback

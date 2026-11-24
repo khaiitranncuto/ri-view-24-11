@@ -15,6 +15,7 @@ class RequestTrace:
         self.attempt = 0
         self.started = None
         self.sent = False
+        self.last_chunk_at = None
         self.chunks = 0
         self.output_chars = 0
         self.meta = {}
@@ -44,6 +45,7 @@ class RequestTrace:
         self.attempt += 1
         self.started = time.monotonic()
         self.sent = False
+        self.last_chunk_at = None
         self.chunks = 0
         self.output_chars = 0
         self.emit('prepare', **self.meta)
@@ -54,10 +56,11 @@ class RequestTrace:
         self.emit('send', queue_seconds=round(self.sent_at - self.started, 3))
 
     def chunk(self, text):
+        self.last_chunk_at = time.monotonic()
         self.chunks += 1
         self.output_chars += len(text)
         if self.chunks == 1:
-            self.emit('first_chunk', elapsed_seconds=round(time.monotonic() - self.sent_at, 3))
+            self.emit('first_chunk', elapsed_seconds=round(self.last_chunk_at - self.sent_at, 3))
 
     def success(self, text):
         self.emit('success', elapsed_seconds=round(time.monotonic() - self.sent_at, 3),
@@ -83,9 +86,19 @@ class RequestTrace:
         # Only opaque request IDs, never error text/URLs/keys or arbitrary headers.
         if request_id and not re.fullmatch(r'[A-Za-z0-9._:/-]{1,180}', str(request_id)):
             request_id = None
+        now = time.monotonic()
+        timing = {}
+        if kind == 'transport_timeout' and self.sent:
+            timing = {
+                'last_chunk_seconds_after_send': (
+                    round(self.last_chunk_at - self.sent_at, 3)
+                    if self.last_chunk_at is not None else None),
+                'seconds_since_last_chunk_or_send': round(
+                    now - (self.last_chunk_at if self.last_chunk_at is not None else self.sent_at), 3),
+            }
         self.emit('failure', category=kind, http_code=code, error_type=type(error).__name__,
-            sent=self.sent, elapsed_seconds=round(time.monotonic() - self.started, 3),
-            chunks=self.chunks, output_chars=self.output_chars, provider_request_id=request_id)
+            sent=self.sent, elapsed_seconds=round(now - self.started, 3),
+            chunks=self.chunks, output_chars=self.output_chars, provider_request_id=request_id, **timing)
 
     def wait(self, seconds, reason):
         self.emit('retry_wait', wait_seconds=seconds, reason=reason)

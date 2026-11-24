@@ -16,7 +16,8 @@ def normalize_non_story_ranges(rows, duration):
             continue
         if (all(math.isfinite(v) for v in (start, end, confidence))
                 and 0 <= start < end <= duration and confidence >= .9
-                and row.get('kind') in {'logo', 'opening', 'credits', 'outro', 'ending_montage'}):
+                and row.get('kind') in {'logo', 'opening', 'credits', 'outro', 'ending_montage',
+                                        'advertisement', 'trailer', 'promo'}):
             result.append(dict(row, start_seconds=start, end_seconds=end))
     return sorted(result, key=lambda r: r['start_seconds'])
 
@@ -255,15 +256,26 @@ def build_situation_plan(chunks, outline, duration, target_words, *, single_time
     # The overview can be wrong by minutes. Exclusion requires shot IDs read
     # during the existing detailed pass; explicit story evidence wins conflicts.
     blocked = [s for c in chunks for s in c.get('confirmed_non_story_shots') or []]
+    blocked_ids = {shot['shot_id'] for shot in blocked if shot.get('shot_id')}
     # Lookahead belongs to the next clip's core interval. Pick one observer
     # before grouping; clip-local situation IDs cannot identify cross-clip
     # duplicates, and both views must never reserve the same source frames.
     claims = {}
+    anchored_claims = set()
     for ci, chunk in enumerate(chunks):
         for source in chunk.get('events') or []:
-            for shot in source.get('visual_sources') or []:
+            sources = source.get('visual_sources') or []
+            for shot in sources:
                 if shot.get('shot_id'):
                     claims.setdefault(shot['shot_id'], []).append((ci, shot))
+            for fact in source.get('grounded_facts') or []:
+                for shot in sources:
+                    sid = shot.get('shot_id')
+                    if sid in (fact.get('shot_ids') or []) and any(
+                        float(shot['start_seconds']) <= point < float(shot['end_seconds'])
+                        for point in fact.get('visual_anchor_seconds', [])
+                    ):
+                        anchored_claims.add((ci, sid))
     shot_owner = {}
     for sid, views in claims.items():
         center = (min(float(s['start_seconds']) for _, s in views)
@@ -272,7 +284,8 @@ def build_situation_plan(chunks, outline, duration, target_words, *, single_time
             chunk = chunks[ci]
             start = float(chunk.get('start_seconds', 0))
             end = float(chunk.get('primary_end_seconds', chunk.get('end_seconds', duration)))
-            return (not start <= center < end, max(start - center, center - end, 0), ci)
+            return ((ci, sid) not in anchored_claims, not start <= center < end,
+                    max(start - center, center - end, 0), ci)
         shot_owner[sid] = min({ci for ci, _ in views}, key=ownership_rank)
     # A source window cannot prove two incompatible situations. Keep these
     # claims for diagnosis instead of joining their prose or guessing an owner.
@@ -300,7 +313,7 @@ def build_situation_plan(chunks, outline, duration, target_words, *, single_time
                 if unsupported_dialogue_fact(fact):
                     continue
                 candidates = [sources[sid] for sid in fact.get('shot_ids') or []
-                              if sid in sources and shot_owner.get(sid) == chunk_index
+                              if sid in sources and sid not in blocked_ids and shot_owner.get(sid) == chunk_index
                               and (chunk_index, sid) not in ambiguous]
                 if not candidates:
                     continue
@@ -348,6 +361,14 @@ def build_situation_plan(chunks, outline, duration, target_words, *, single_time
                      < float(b.get('end_seconds', 0))), {})
         row['story_beat_id'] = beat.get('beat_id', f'GB{len(events) + 1:03d}')
         row['story_beat_summary'] = beat.get('summary', '')
+        # Keep the director pass' story spine separate from shot-level facts.
+        # The writer uses this only as context, while every narrated claim must
+        # still bind to an observed visual or dialogue fact.
+        row['story_beat_cause'] = beat.get('cause', '')
+        row['story_beat_goal'] = beat.get('goal', '')
+        row['story_beat_state_before'] = beat.get('state_before', '')
+        row['story_beat_state_after'] = beat.get('state_after', '')
+        row['story_beat_outcome'] = beat.get('outcome', '')
         events.append(row)
     for event in events:
         event.pop('_situation_key', None)
@@ -362,6 +383,11 @@ def build_situation_plan(chunks, outline, duration, target_words, *, single_time
         event['transcript_evidence'] = transcript
         event['spoken_text'] = ' '.join(line['text'] for line in transcript)
     events.sort(key=lambda e: e['start_seconds'])
+    for index, event in enumerate(events):
+        previous_beat = events[index - 1].get('story_beat_id') if index else None
+        next_beat = events[index + 1].get('story_beat_id') if index + 1 < len(events) else None
+        event['story_beat_opening'] = event.get('story_beat_id') != previous_beat
+        event['story_beat_closing'] = event.get('story_beat_id') != next_beat
     for i, event in enumerate(events, 1):
         event.update(event_id=f'E{i:04d}', scene_id=f'S{i:04d}')
     if len(events) < (1 if single_timeline else 3):

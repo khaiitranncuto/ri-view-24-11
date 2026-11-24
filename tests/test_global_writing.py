@@ -10,6 +10,19 @@ from source_grounded_writer import is_source_grounded
 
 
 class GlobalWritingTests(unittest.TestCase):
+    def test_merge_preserves_locked_scene_when_another_scene_uses_visual_fallback(self):
+        response = json.dumps({"parts": [{"scenes": [
+            {"scene_id": "S0001", "start": "00:00.00", "end": "00:06.00",
+             "grounded_plan_locked": True, "planned_fact_ids": ["F1"]},
+            {"scene_id": "S0002", "start": "00:06.00", "end": "00:12.00",
+             "visual_alignment_errors": ["missing_valid_verdict"]},
+        ]}]})
+
+        merged = merge_single_part_responses([response], [0, 12], 40, single_timeline=True)
+
+        self.assertEqual(len(merged["parts"]), 1)
+        self.assertEqual(merged["parts"][0]["scenes"], json.loads(response)["parts"][0]["scenes"])
+
     def plan(self):
         events = [dict(event_id=f'E{i:04d}', scene_id=f'S{i:04d}',
             start_seconds=(i - 1) * 12, end_seconds=(i - 1) * 12 + 6,

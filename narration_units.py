@@ -141,6 +141,18 @@ def plan_narration_units(plan):
                     target_words=unit_word_target,
                     focus=' '.join(facts[fid]['text'] for fid in ids)))
             event.update(sentence_slots=slots, narration_unit_version=1, visual_sources=sources)
+            unused_ideas = list(event.get('sentence_ideas') or [])
+            for slot in slots:
+                matches = [idea for idea in unused_ideas
+                           if set(idea['fact_ids']) & set(slot['fact_ids'])]
+                if matches:
+                    idea = max(matches, key=lambda item: item['importance'])
+                    slot['narrative_task'] = dict(role=idea['role'], purpose=idea['purpose'],
+                        fact_ids=idea['fact_ids'])
+                    unused_ideas.remove(idea)
+                else:
+                    slot['narrative_task'] = dict(role='development',
+                        purpose=slot['focus'], fact_ids=slot['fact_ids'])
             validate_narration_unit_order(event)
     result['narration_unit_version'] = 1
     return result
@@ -276,7 +288,7 @@ def unit_prompt(events, context, previous=None, error=None):
 
 
 def generate_unit_chunks(event, context, generate, prompt_builder, previous=None, error=None,
-                         save_raw=None):
+                         save_raw=None, max_chars=14000, max_repairs=2):
     """Keep original unit IDs and bind only after the entire event is assembled."""
     from recap_visual_media import parse_writing_response
     from narrative_contract import sentences
@@ -320,13 +332,13 @@ def generate_unit_chunks(event, context, generate, prompt_builder, previous=None
             candidate = selected + [slot]
             partial = dict(event, sentence_slots=candidate, sentence_quota=len(candidate))
             prompt = prompt_builder([partial], chunk_context, previous, error)
-            if selected and len(prompt) > 14000:
+            if selected and len(prompt) > max_chars:
                 # Finish this planned sentence only when the overrun is small
                 # and at least half its incremental input still fits.
                 old = dict(event, sentence_slots=selected, sentence_quota=len(selected))
                 old_size = len(prompt_builder([old], chunk_context, previous, error))
                 increment = len(prompt) - old_size
-                if len(prompt) <= 15500 and 14000 - old_size >= increment / 2:
+                if len(prompt) <= 15500 and max_chars - old_size >= increment / 2:
                     selected = candidate
                 break
             selected = candidate
@@ -356,7 +368,7 @@ def generate_unit_chunks(event, context, generate, prompt_builder, previous=None
             if slot['unit_id'] in valid:
                 continue
             single = dict(event, sentence_slots=[slot], sentence_quota=1)
-            for attempt in range(2):
+            for attempt in range(max_repairs):
                 repair = 'NARRATION_UNIT_IDS_INVALID: expected event_id=' + event['event_id'] + '; unit_id=' + slot['unit_id']
                 raw = generate([single], prompt_builder([single], chunk_context, previous, repair))
                 if save_raw:
@@ -384,6 +396,7 @@ def generate_unit_chunks(event, context, generate, prompt_builder, previous=None
 
 def unit_response(payload, events):
     from narrative_contract import sentences, words
+    from narrative_first import MATCH_AFTER_WRITING_VERSION
     rows = payload.get('sentences') if isinstance(payload, dict) else None
     if not isinstance(rows, list):
         raise ValueError('NARRATION_UNIT_SCHEMA_INVALID')
@@ -424,11 +437,17 @@ def unit_response(payload, events):
             }
         facts = {f['fact_id']: f for f in event['observed_facts']}
         proofs = []
-        for slot in event['sentence_slots']:
-            kinds = {facts[fid].get('evidence_kind', 'visual') for fid in slot['fact_ids']}
+        deferred = event.get('narrative_first_version') == MATCH_AFTER_WRITING_VERSION
+        for index, slot in enumerate(event['sentence_slots']):
+            ids = units[index].get('fact_ids') if deferred and index < len(units) else slot['fact_ids']
+            if not isinstance(ids, list) or not ids or any(
+                    not isinstance(fid, str) or fid not in facts for fid in ids):
+                error = 'NARRATION_UNIT_EVIDENCE_INVALID:' + slot['unit_id']
+                continue
+            kinds = {facts[fid].get('evidence_kind', 'visual') for fid in ids}
             if len(kinds) != 1:
                 error = 'NARRATION_UNIT_MIXED_SOURCE:' + slot['unit_id']
-            proofs.append(dict(fact_ids=slot['fact_ids'], evidence_kind=next(iter(kinds))))
+            proofs.append(dict(fact_ids=ids, evidence_kind=next(iter(kinds))))
         result.append(dict(event_id=eid, paragraph=' '.join(u.get('text', '') for u in units if isinstance(u.get('text'), str)),
             narration_units=copy.deepcopy(units), sentence_evidence=proofs,
             **({'word_budget_warning': word_budget_warning} if word_budget_warning else {}),

@@ -3,11 +3,12 @@ import os
 import threading
 import time
 import uuid
+import hashlib
 
 
 WORKSPACE_DIR = os.path.dirname(os.path.abspath(__file__))
 JOB_DIR = os.path.join(WORKSPACE_DIR, ".jobs")
-_write_lock = threading.Lock()
+_write_lock = threading.RLock()
 
 
 def _safe_task_id(task_id):
@@ -33,7 +34,7 @@ def _atomic_write_json(path, data):
         temp_path = f"{path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
         try:
             with open(temp_path, "w", encoding="utf-8", newline="\n") as output:
-                json.dump(data, output, ensure_ascii=False, separators=(',', ':'))
+                output.write(json.dumps(data, ensure_ascii=False, separators=(',', ':')))
                 output.flush()
                 os.fsync(output.fileno())
             # Browser polling can briefly keep the old JSON open on Windows.
@@ -60,15 +61,60 @@ def save_task_state(task_id, state):
     snapshot = dict(state)
     snapshot["task_id"] = _safe_task_id(task_id)
     snapshot["updated_at"] = time.time()
-    _atomic_write_json(task_state_path(task_id), snapshot)
+    with _write_lock:
+        _save_state_record(task_id, snapshot)
     return snapshot
+
+
+def _save_state_record(task_id, state):
+    """Publish immutable large fields before atomically publishing their references."""
+    record = dict(state)
+    references = dict(record.pop('_task_store_fields', {}))
+    for key, value in list(record.items()):
+        encoded = json.dumps(value, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+        references.pop(key, None)
+        if len(encoded) < 65536:
+            continue
+        digest = hashlib.sha256(encoded).hexdigest()
+        directory = os.path.join(JOB_DIR, _safe_task_id(task_id) + '.fields')
+        path = os.path.join(directory, digest + '.json')
+        if not os.path.isfile(path):
+            _atomic_write_json(path, value)
+        references[key] = digest
+        del record[key]
+    if references:
+        record['_task_store_fields'] = references
+    _atomic_write_json(task_state_path(task_id), record)
+
+
+def save_task_patch(task_id, fields):
+    """Update changed fields without loading or rewriting large source archives."""
+    with _write_lock:
+        try:
+            with open(task_state_path(task_id), encoding='utf-8') as source:
+                record = json.load(source)
+        except FileNotFoundError:
+            record = {}
+        record.update(fields)
+        record['task_id'] = _safe_task_id(task_id)
+        record['updated_at'] = time.time()
+        _save_state_record(task_id, record)
 
 
 def load_task_state(task_id):
     try:
         with open(task_state_path(task_id), "r", encoding="utf-8") as source:
             value = json.load(source)
-        return value if isinstance(value, dict) else None
+        if not isinstance(value, dict):
+            return None
+        for key, digest in value.pop('_task_store_fields', {}).items():
+            if (not isinstance(digest, str) or len(digest) != 64
+                    or any(c not in '0123456789abcdef' for c in digest)):
+                raise ValueError('Invalid task field reference')
+            path = os.path.join(JOB_DIR, _safe_task_id(task_id) + '.fields', digest + '.json')
+            with open(path, encoding='utf-8') as field:
+                value[key] = json.load(field)
+        return value
     except (OSError, ValueError, json.JSONDecodeError):
         return None
 

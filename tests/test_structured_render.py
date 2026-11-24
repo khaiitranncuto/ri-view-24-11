@@ -61,6 +61,20 @@ class StructuredRenderTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'thiếu hình'):
             strict_visual_edl(texts, [20], groups, cues)
 
+    def test_continuity_uses_adjacent_footage_without_crossing_excluded_shots(self):
+        from video_renderer import build_visual_edit_plan
+        shot = dict(start=10, end=12, anchors=[11], prefer_continuity=True,
+                    region_id='E1', region_start=8, region_end=14)
+        options = dict(strict_visual_lock=True, visual_draft_shots=[shot],
+                       excluded_source_shots=[dict(start_seconds=8, end_seconds=9)])
+        first, second = build_visual_edit_plan([4, 2], [10, 13], [12, 15], 20, **options)
+        self.assertEqual(first['shot_spans'], [(9, 4)])
+        self.assertEqual(first['hold_duration'], 0)
+        self.assertEqual(second['source_start'], 13)
+        capped, _ = build_visual_edit_plan([5, 2], [10, 13], [12, 15], 20, **options)
+        self.assertEqual(capped['shot_spans'], [(9, 4)])
+        self.assertEqual(capped['hold_duration'], 1)
+
     def test_extension_fills_speech_but_stops_at_next_locked_shot_and_eof(self):
         from video_renderer import build_visual_edit_plan
         plan = build_visual_edit_plan([10, 3], [0, 12], [6, 15], 20,

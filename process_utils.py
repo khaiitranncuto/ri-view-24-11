@@ -1,5 +1,28 @@
 import os
 import subprocess
+import sys
+import builtins
+
+
+def console_print(*values, **options):
+    """Log không được làm dừng tác vụ khi debugger thay luồng console."""
+    try:
+        builtins.print(*values, **options)
+    except UnicodeEncodeError:
+        safe_values = [str(value).encode('ascii', errors='backslashreplace').decode('ascii')
+                       for value in values]
+        builtins.print(*safe_values, **options)
+
+
+def configure_utf8_console():
+    """Cho phép log tiếng Việt khi Windows chuyển stdout sang tệp hoặc debugger."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, 'reconfigure', None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding='utf-8', errors='backslashreplace')
+            except (OSError, ValueError):
+                pass
 
 
 _ORIGINAL_POPEN = subprocess.Popen

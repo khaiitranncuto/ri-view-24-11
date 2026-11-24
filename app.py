@@ -10,6 +10,9 @@ import re
 import traceback
 import faulthandler
 import sys
+from process_utils import configure_utf8_console
+from process_utils import console_print as print
+configure_utf8_console()
 import math
 import tempfile
 import unicodedata
@@ -31,6 +34,7 @@ from task_store import (
     load_task_state,
     save_task_payload,
     save_task_state,
+    save_task_patch,
 )
 from event_storyboard import (
     clamp_final_timeline_end,
@@ -42,7 +46,6 @@ from event_storyboard import (
 from recap_pipeline import (
     build_full_video_outline_prompt,
     build_evidence_review_prompt,
-    build_evidence_replenishment_prompt,
     build_identity_comparison_prompt,
     build_chunk_evidence_prompt,
     build_part_story_context,
@@ -74,7 +77,6 @@ from recap_pipeline import (
     add_objective_evidence_gap_windows,
     normalize_chunk_evidence,
     recover_chunk_evidence,
-    merge_evidence_replenishment,
     assess_story_evidence_coverage,
     deduplicate_overlapping_chunk_evidence,
     deduplicate_semantic_chunk_evidence,
@@ -87,7 +89,6 @@ from recap_pipeline import (
     parse_json_object,
     payload_to_timeline,
     plan_adaptive_story_boundaries,
-    plan_evidence_replenishment,
     plan_targeted_evidence_gap_windows,
     proportional_part_targets,
     requested_word_range,
@@ -321,6 +322,7 @@ DEFAULT_API_KEY = ""
 STORY_PLAN_MAX_ATTEMPTS = 2
 GEMINI_GENERATION_MAX_ATTEMPTS = 3
 GEMINI_REQUEST_TIMEOUT_SECONDS = 6 * 60
+GEMINI_DETAIL_READ_TIMEOUT_SECONDS = 90
 GEMINI_RECAP_READ_TIMEOUT_SECONDS = 70
 GEMINI_503_MAX_RETRIES = 2
 GEMINI_503_RETRY_DELAYS = (3 * 60, 3 * 60)
@@ -356,6 +358,7 @@ EVIDENCE_CONTRACT_VERSION = 21
 # source audio twice. Detailed silent chapter passes use two FPS.
 FULL_VIDEO_ANALYSIS_FPS = 0.1
 DETAIL_VIDEO_ANALYSIS_FPS = 2.0
+ACTION_VIDEO_ANALYSIS_FPS = 3.0
 GEMINI_PRIMARY_PART_COUNT = 3
 GEMINI_EVENT_LOOKAHEAD_SECONDS = 90
 MAX_TARGETED_VISUAL_REVIEWS = 2
@@ -413,10 +416,14 @@ def _persist_task_if_needed(task_id):
             return
         _task_log_checkpoint_at[task_id] = now
         task = TASKS.get(task_id)
-        snapshot = copy.deepcopy(task) if task and task.get("persistent") else None
+        snapshot = (copy.deepcopy(task) if terminal else copy.deepcopy({
+            key: value for key, value in task.items()
+            if value is None or isinstance(value, (str, int, float, bool))
+            or key in ('logs', 'active_writing_context')
+        })) if task and task.get('persistent') else None
     if snapshot is not None:
         try:
-            save_task_state(task_id, snapshot)
+            (save_task_state if terminal else save_task_patch)(task_id, snapshot)
         except OSError as exc:
             # A transient Windows file lock must never abort video/TTS work.
             # A later heartbeat or log entry will checkpoint the same RAM state.
@@ -428,19 +435,30 @@ def update_task_fields(task_id, **fields):
     with task_lock:
         task = TASKS.setdefault(task_id, {"logs": [], "persistent": True})
         task.update(fields)
+        checkpoint_fields = fields
         # Progress and diagnostic counters are recoverable; durable artifacts,
         # status and results still checkpoint immediately.
         transient = {'progress', 'message', 'visual_fallback_reports', 'visual_fallback_count',
-                     'heartbeat_at', 'narration_audit_checkpoint', 'grounded_narration_audit'}
+                     'heartbeat_at'}
         if set(fields).issubset(transient):
             now = time.monotonic()
             if now - _task_log_checkpoint_at.get(task_id, -float('inf')) < 15:
                 return None
             _task_log_checkpoint_at[task_id] = now
-        snapshot = copy.deepcopy(task) if task.get("persistent") else None
+            if task.get('task_kind') == 'render':
+                # The detached worker's heartbeat shares the checkpoint timer
+                # with progress and logs. Publish all three when it wins.
+                checkpoint_fields = {
+                    **fields,
+                    'progress': task.get('progress', 0),
+                    'message': task.get('message', ''),
+                    'logs': task.get('logs', []),
+                }
+        terminal = task.get('status') in ('success', 'failed')
+        snapshot = copy.deepcopy(task if terminal else checkpoint_fields) if task.get("persistent") else None
     if snapshot is not None:
         try:
-            save_task_state(task_id, snapshot)
+            (save_task_state if terminal else save_task_patch)(task_id, snapshot)
         except OSError as exc:
             print(f"[TASK STATE WARNING] Chua luu duoc checkpoint {task_id[:8]}: {exc}", flush=True)
     return snapshot
@@ -489,7 +507,8 @@ def append_task_log(task_id, level, message, details=""):
             if details:
                 log_file.write(str(details).rstrip() + "\n")
             log_file.flush()
-            os.fsync(log_file.fileno())
+            if entry['level'] == 'ERROR':
+                os.fsync(log_file.fileno())
     except OSError as log_error:
         print(f"[LOG ERROR] Khong ghi duoc task log: {log_error}", flush=True)
     print(f"[{entry['time']}] [{entry['level']}] [task {task_id[:8]}] {entry['message']}", flush=True)
@@ -842,6 +861,14 @@ def is_transient_gemini_error(error):
 
 
 def is_gemini_transport_timeout(error):
+    current, seen = error, set()
+    timeout_types = {'TimeoutError', 'TimeoutException', 'ReadTimeout',
+                     'WriteTimeout', 'ConnectTimeout', 'PoolTimeout'}
+    while isinstance(current, BaseException) and id(current) not in seen:
+        seen.add(id(current))
+        if any(cls.__name__ in timeout_types for cls in type(current).__mro__):
+            return True
+        current = current.__cause__ or current.__context__
     message = gemini_error_chain_text(error).lower()
     return any(marker in message for marker in ('readtimeout', 'connecttimeout', 'timeout', 'timed out'))
 
@@ -1079,7 +1106,8 @@ def generate_gemini_text_with_recovery(
     usage_callback=None, quota_pacer=None, estimated_input_tokens=0,
     capacity_max_retries=None, retry_timeouts=True,
     minute_quota_max_retries=None, retry_transport_errors=True,
-    diagnostic_callback=None, timeout_retry_delay_seconds=None,
+    diagnostic_callback=None, timeout_retry_delay_seconds=None, capacity_retry_delays=None,
+    timeout_max_retries=1,
 ):
     """Generate text with streaming and bounded recovery for transport/TPM errors."""
     last_error = None
@@ -1088,6 +1116,7 @@ def generate_gemini_text_with_recovery(
     timeout_retries = 0
     capacity_wait_mode = False
     fast_attempt_limit = max(1, int(max_attempts))
+    capacity_retry_delays = capacity_retry_delays or GEMINI_503_RETRY_DELAYS
     from request_diagnostics import RequestTrace
     trace = RequestTrace(diagnostic_callback or getattr(usage_callback, 'diagnostic_callback', None),
                          label, model, contents, config)
@@ -1106,6 +1135,7 @@ def generate_gemini_text_with_recovery(
             if stream:
                 parts = []
                 usage = {}
+                finish_reason = None
                 for chunk in client.models.generate_content_stream(
                     model=model, contents=contents, config=config
                 ):
@@ -1114,11 +1144,17 @@ def generate_gemini_text_with_recovery(
                     )
                     if chunk_usage.get("total_tokens"):
                         usage = chunk_usage
+                    for candidate in getattr(chunk, 'candidates', None) or []:
+                        reason = getattr(candidate, 'finish_reason', None)
+                        if reason:
+                            finish_reason = str(getattr(reason, 'name', reason))
                     chunk_text = str(getattr(chunk, "text", "") or "")
                     trace.chunk(chunk_text)
                     if chunk_text:
                         parts.append(chunk_text)
                 result_text = "".join(parts).strip()
+                if finish_reason:
+                    trace.emit('stream_finish', finish_reason=finish_reason)
             else:
                 response = client.models.generate_content(
                     model=model, contents=contents, config=config
@@ -1188,9 +1224,10 @@ def generate_gemini_text_with_recovery(
             if ((is_gemini_transport_timeout(exc) and retry_timeouts)
                     or (is_gemini_transport_error(exc) and retry_transport_errors
                         and not is_gemini_transport_timeout(exc))):
-                # A timeout replays only this request, once, even for stages
-                # configured with one semantic attempt. Completed work stays.
-                if timeout_retries >= 1:
+                transport_retry_limit = (
+                    timeout_max_retries if is_gemini_transport_timeout(exc) else 1
+                )
+                if timeout_retries >= transport_retry_limit:
                     trace.emit('stopped', reason='transport_retry_limit')
                     raise
                 timeout_retries += 1
@@ -1211,8 +1248,8 @@ def generate_gemini_text_with_recovery(
             delay = (
                 timeout_retry_delay_seconds
                 if timeout_retry_delay_seconds is not None and is_gemini_transport_timeout(exc) else
-                float(GEMINI_503_RETRY_DELAYS[min(
-                    attempt, len(GEMINI_503_RETRY_DELAYS) - 1
+                float(capacity_retry_delays[min(
+                    attempt, len(capacity_retry_delays) - 1
                 )])
                 if is_capacity_503 else
                 gemini_retry_delay_seconds(exc, attempt)
@@ -1629,9 +1666,26 @@ def split_video_into_batches(
     return boundaries, outputs
 
 
+def story_detail_frame_rates(boundaries, outline):
+    """Use 3 fps for clips centered on, or mostly covered by, a priority beat."""
+    priority_ranges = [
+        (beat['start_seconds'], beat['end_seconds'])
+        for beat in (outline or {}).get('story_beats', [])
+        if beat.get('detail_level') == 'detailed'
+        or beat.get('story_role') == 'climax'
+        or beat.get('narrative_function') in {'turning_point', 'reversal', 'climax'}
+        or beat.get('is_final_action')
+    ]
+    return [ACTION_VIDEO_ANALYSIS_FPS if any(
+                start <= (left + right) / 2 < end
+                or min(end, right) - max(start, left) >= (end - start) / 2
+                for left, right in priority_ranges) else DETAIL_VIDEO_ANALYSIS_FPS
+            for start, end in zip(boundaries, boundaries[1:])]
+
+
 def split_video_into_overlapping_batches(
     source_path, output_dir, duration_sec, boundaries, ffmpeg_exe, prefix,
-    overlap_seconds=15.0, indexed=False,
+    overlap_seconds=15.0, indexed=False, indexed_frame_rates=None,
 ):
     """Cut core chapters with right-side lookahead so open events can finish.
 
@@ -1662,7 +1716,9 @@ def split_video_into_overlapping_batches(
         output_path = os.path.join(output_dir, f"{prefix}_{index + 1}.mp4")
         if indexed:
             from grounded_pipeline import indexed_clip
-            indexed_clip(source_path, output_path, start, end, ffmpeg_exe, fps=DETAIL_VIDEO_ANALYSIS_FPS)
+            clip_fps = (indexed_frame_rates[index] if indexed_frame_rates is not None
+                        else DETAIL_VIDEO_ANALYSIS_FPS)
+            indexed_clip(source_path, output_path, start, end, ffmpeg_exe, fps=clip_fps)
             windows.append((start, end))
             outputs.append(output_path)
             continue
@@ -1885,6 +1941,8 @@ def _analyze_video_bg_once(
     client_upload = None
     partial_script_lines = []
     transcript_executor = None
+    evidence_prefetch_executor = None
+    stop_evidence_prefetch = threading.Event()
     transcript_future = None
     gemini_usage_totals = {
         "input_tokens": 0, "output_tokens": 0, "thought_tokens": 0,
@@ -1942,6 +2000,9 @@ def _analyze_video_bg_once(
         return max(0.0, total)
 
     def cleanup_analysis_artifacts(preserve_local=False):
+        if evidence_prefetch_executor is not None:
+            stop_evidence_prefetch.set()
+            evidence_prefetch_executor.shutdown(wait=True, cancel_futures=True)
         if client is not None:
             for remote_file in list(remote_files):
                 try:
@@ -2266,6 +2327,18 @@ def _analyze_video_bg_once(
         from grounded_pipeline import observation_response_schema
         observation_config = pass1_config.model_copy(update={
             'response_json_schema': observation_response_schema()})
+        detail_observation_config = observation_config.model_copy(update={
+            'http_options': generation_http_opts.model_copy(update={
+                'timeout': GEMINI_DETAIL_READ_TIMEOUT_SECONDS * 1000,
+                # The SDK derives a server deadline from the HTTP timeout by
+                # default. Keep the existing server budget for active streams.
+                'headers': {'X-Server-Timeout': str(GEMINI_REQUEST_TIMEOUT_SECONDS)},
+            }),
+        })
+        detail_retry_options = dict(
+            timeout_max_retries=3, timeout_retry_delay_seconds=5,
+            capacity_retry_delays=(120,),
+        )
         story_plan_config = genai_types.GenerateContentConfig(
             temperature=0.1,
             max_output_tokens=16384,
@@ -2287,23 +2360,43 @@ def _analyze_video_bg_once(
             http_options=genai_types.HttpOptions(timeout=upload_timeout * 1000),
         )
         from grounded_pipeline import observation_cache_path, load_observation_cache, save_observation_cache
+        from flat_writer import writer_format
+        recap_format = writer_format()
+        whole_film_writer = recap_format == 'whole_film'
+        legacy_observation_version = 1000 + EVIDENCE_CONTRACT_VERSION if whole_film_writer else EVIDENCE_CONTRACT_VERSION
+        observation_version = legacy_observation_version + 1002 if whole_film_writer else legacy_observation_version
+        story_workflow_version = 18 if whole_film_writer else 13
         grounding_cache_path = observation_cache_path(
-            os.path.join(WORKSPACE_DIR, '.cache'), video_path, 0,
-            EVIDENCE_CONTRACT_VERSION, subtitle_text, fps=DETAIL_VIDEO_ANALYSIS_FPS)
+            os.path.join(WORKSPACE_DIR, '.cache'), video_path,
+            budget['target_sentence_count'] if whole_film_writer else 0,
+            observation_version, subtitle_text, fps=DETAIL_VIDEO_ANALYSIS_FPS)
         cached_grounding = load_observation_cache(grounding_cache_path)
         with task_lock:
             current_grounding = copy.deepcopy(TASKS.get(task_id, {}))
         restored_raw = dict(cached_grounding.get('primary_grounding_responses') or {})
         previous_contract = (current_grounding.get('observation_contract_version') or
                              (current_grounding.get('chapter_evidence_checkpoint') or {}).get('evidence_contract_version'))
-        if previous_contract == EVIDENCE_CONTRACT_VERSION:
+        if previous_contract == observation_version:
             restored_raw.update(current_grounding.get('primary_grounding_responses') or {})
+        if whole_film_writer and previous_contract != observation_version:
+            update_task_fields(task_id, chapter_evidence_checkpoint={}, detail_review_checkpoint={},
+                               character_registry_checkpoint={}, part_writing_checkpoint={},
+                               grounding_recovery_responses={}, grounded_narration_audit={})
         update_task_fields(task_id, primary_grounding_responses=restored_raw,
-                           observation_contract_version=EVIDENCE_CONTRACT_VERSION)
+                           observation_contract_version=observation_version)
         full_video_outline = (current_grounding.get('full_video_outline')
                               if current_grounding.get('full_video_outline_complete') else None)
         if not full_video_outline and cached_grounding.get('full_video_outline_complete'):
             full_video_outline = cached_grounding.get('full_video_outline')
+        if whole_film_writer and not full_video_outline:
+            for old_version in (legacy_observation_version + 1001, legacy_observation_version + 1000,
+                                legacy_observation_version):
+                old_cache = load_observation_cache(observation_cache_path(
+                    os.path.join(WORKSPACE_DIR, '.cache'), video_path, budget['target_sentence_count'],
+                    old_version, subtitle_text, fps=DETAIL_VIDEO_ANALYSIS_FPS))
+                if old_cache.get('full_video_outline_complete') and old_cache.get('full_video_outline'):
+                    full_video_outline = old_cache['full_video_outline']
+                    break
         full_outline_calls = 0
         if full_video_outline:
             update_task_fields(task_id, full_video_outline=copy.deepcopy(full_video_outline),
@@ -2346,6 +2439,11 @@ def _analyze_video_bg_once(
                         max_characters=160000,
                     ),
                 )
+                if whole_film_writer:
+                    overview_prompt += (
+                        '\nDat moc mo dau va ket thuc cho tung dien bien tron ven, dua tren thoi gian phim. '
+                        'Ghi tinh huong ban dau, buoc ngoat va ket qua; danh dau cho doi tuyen, doi dia diem '
+                        'hoac nhay thoi gian. Chi noi hai dien bien la he qua hay song song khi phim cho thay.')
                 full_outline_calls += 1
                 overview_text = generate_gemini_text_with_recovery(
                     client,
@@ -2445,7 +2543,7 @@ def _analyze_video_bg_once(
         # source IDs. Their overlap preserves actions crossing a boundary.
         from grounded_pipeline import shot_index, observation_prompt, bind_observations, parse_observations, recover_observations
         source_shot_index = shot_index(video_duration_sec)
-        # Four-minute reels keep the complete 2-FPS pass detailed enough for a
+        # Four-minute reels keep the detailed pass granular enough for a
         # long recap.  The old eight-minute reels made the model collapse many
         # visible action changes into a single broad fact.
         evidence_chunk_count = max(1, math.ceil(video_duration_sec / (4 * 60)))
@@ -2453,6 +2551,16 @@ def _analyze_video_bg_once(
             video_duration_sec * index / evidence_chunk_count
             for index in range(evidence_chunk_count + 1)
         ]
+        if whole_film_writer:
+            adaptive_evidence_boundaries = plan_adaptive_story_boundaries(
+                full_video_outline, video_duration_sec, target_chunk_seconds=240,
+                min_chunk_seconds=120, max_chunk_seconds=360, strict_max_chunk=True)
+            from evidence_inventory import observation_targets
+            clip_targets = observation_targets(adaptive_evidence_boundaries, full_video_outline,
+                                               budget['target_sentence_count'])
+        evidence_frame_rates = story_detail_frame_rates(
+            adaptive_evidence_boundaries, full_video_outline if whole_film_writer else None)
+        update_task_fields(task_id, video_analysis_fps_by_clip=evidence_frame_rates)
         evidence_windows, evidence_paths = split_video_into_overlapping_batches(
             video_path,
             upload_staging_dir,
@@ -2460,14 +2568,15 @@ def _analyze_video_bg_once(
             adaptive_evidence_boundaries,
             ffmpeg_exe,
             prefix="story_evidence",
-            overlap_seconds=30.0, indexed=True,
+            overlap_seconds=30.0, indexed=True, indexed_frame_rates=evidence_frame_rates,
         )
         append_task_log(
             task_id,
             "INFO",
             "Ranh gioi clip bang chung theo cum truyen: "
             + ", ".join(
-                f"{start:.1f}-{end:.1f}s" for start, end in evidence_windows
+                f"{start:.1f}-{end:.1f}s ({fps:g} fps)"
+                for (start, end), fps in zip(evidence_windows, evidence_frame_rates)
             ),
         )
         expected_checkpoint_windows = [
@@ -2519,45 +2628,94 @@ def _analyze_video_bg_once(
                 f"tiep tuc tu doan {completed_chunks + 1}.",
             )
 
-        def ensure_evidence_content(chunk_index, progress):
-            if evidence_contents[chunk_index] is not None:
-                return evidence_contents[chunk_index]
+        prefetched_evidence = None
+        if whole_film_writer and len(evidence_paths) - completed_chunks > 1:
+            evidence_prefetch_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='evidence-upload')
+
+        def prefetch_sleep(seconds):
+            if stop_evidence_prefetch.wait(seconds):
+                raise RuntimeError('Evidence prefetch stopped')
+
+        def prepare_evidence_content(chunk_index, progress=None):
             chunk_number = chunk_index + 1
+            background = progress is None
+            sleep_fn = prefetch_sleep if background else time.sleep
             evidence_file = upload_gemini_file_with_recovery(
                 client_upload,
                 evidence_paths[chunk_index],
                 label=f"bang chung {chunk_number}",
-                update_progress=lambda message, p=progress: update_prog(p, message),
+                update_progress=None if background else lambda message: update_prog(progress, message),
                 max_attempts=3,
+                sleep_fn=sleep_fn,
             )
             remote_files.append(evidence_file)
             wait_for_gemini_file(
-                client,
+                client_upload if background else client,
                 evidence_file.name,
                 max_wait_seconds=900,
                 poll_interval=5,
-                sleep_fn=time.sleep,
-                on_wait=lambda waited, limit, p=progress: update_prog(
-                    p, f"Gemini dang xu ly doan ngan... ({waited}s/{limit}s)"
+                sleep_fn=sleep_fn,
+                on_wait=None if background else lambda waited, limit: update_prog(
+                    progress, f"Gemini dang xu ly doan ngan... ({waited}s/{limit}s)"
                 ),
             )
-            evidence_contents[chunk_index] = build_full_video_gemini_part(
-                genai_types, evidence_file, fps=DETAIL_VIDEO_ANALYSIS_FPS
+            return build_full_video_gemini_part(
+                genai_types, evidence_file, fps=evidence_frame_rates[chunk_index]
             )
+
+        def ensure_evidence_content(chunk_index, progress):
+            nonlocal prefetched_evidence
+            if evidence_contents[chunk_index] is None:
+                if prefetched_evidence is not None and prefetched_evidence[0] == chunk_index:
+                    _, future = prefetched_evidence
+                    prefetched_evidence = None
+                    evidence_contents[chunk_index] = future.result()
+                else:
+                    evidence_contents[chunk_index] = prepare_evidence_content(chunk_index, progress)
             return evidence_contents[chunk_index]
 
         desired_scene_count = required_tts_scene_count(target_recap_words)
         primary_observation_calls = 0
-        for chunk_index, evidence_path in enumerate(evidence_paths):
+        evidence_by_index = dict(enumerate(chunk_evidence))
+        provisional = set()
+        deferred_until = {}
+        capacity_retry_delay_seconds = 3 * 60
+        next_fresh = completed_chunks
+        total_evidence = len(evidence_paths)
+        while next_fresh < total_evidence or deferred_until or provisional:
+            now = time.monotonic()
+            ready = [index for index, deadline in deferred_until.items() if deadline <= now]
+            ready.extend(index for index in provisional if index not in deferred_until
+                         and index - 1 in evidence_by_index and index - 1 not in provisional)
+            if ready:
+                chunk_index = min(ready)
+                deferred_until.pop(chunk_index, None)
+            elif next_fresh < total_evidence:
+                chunk_index = next_fresh
+                next_fresh += 1
+            else:
+                deadline = min(deferred_until.values())
+                waiting = ', '.join(str(index + 1) for index in sorted(deferred_until))
+                wait_with_progress(
+                    deadline - now, f'Gemini dang qua tai; tu thu lai doan {waiting}',
+                    update_progress=lambda message: update_prog(progress, message),
+                )
+                continue
+
             chunk_number = chunk_index + 1
             chunk_start, chunk_end = evidence_windows[chunk_index]
             chunk_duration = chunk_end - chunk_start
-            progress = 22 + int(13 * chunk_number / len(evidence_paths))
-            if chunk_index < completed_chunks:
-                continue
+            final_count = len(evidence_by_index) - len(provisional)
+            progress = 22 + int(13 * final_count / total_evidence)
+            missing_previous = chunk_index > 0 and chunk_index - 1 not in evidence_by_index
+            review_boundary = chunk_index in provisional and not missing_previous
+            previous_evidence = evidence_by_index.get(chunk_index - 1) or {}
+            earlier_evidence = [evidence_by_index[index] for index in sorted(evidence_by_index)
+                                if index < chunk_index]
+            raw_key = f'provisional:{chunk_number}' if missing_previous else str(chunk_number)
             with task_lock:
                 raw_observations = copy.deepcopy(TASKS.get(task_id, {}).get('primary_grounding_responses') or {})
-            evidence_text = raw_observations.get(str(chunk_number))
+            evidence_text = None if review_boundary else raw_observations.get(raw_key)
             if evidence_text:
                 try:
                     cached_bound = bind_observations(parse_observations(evidence_text), source_shot_index,
@@ -2568,7 +2726,7 @@ def _analyze_video_bg_once(
                     append_task_log(task_id, 'WARNING',
                         f'Doan {chunk_number}: phan hoi cu khong dung duoc; chi yeu cau lai doan nay.')
                     evidence_text = None
-            if chunk_index and not evidence_text:
+            if chunk_index and not evidence_text and not whole_film_writer:
                 wait_with_progress(
                     BATCH_REQUEST_COOLDOWN_SECONDS,
                     "Dang nghi giua cac doan de tranh Gemini qua tai",
@@ -2592,72 +2750,110 @@ def _analyze_video_bg_once(
             # Carry both confirmed names and locked neutral aliases. Unknown
             # people keep one stable descriptive label across all three parts.
             from situation_recap import character_registry, bind_character_registry
-            rolling_character_registry = character_registry(registry_outline, chunk_evidence, transcript_segments=transcript_segments)
+            rolling_character_registry = character_registry(registry_outline, earlier_evidence, transcript_segments=transcript_segments)
             evidence_prompt = observation_prompt(
                 chunk_number, chunk_start, chunk_end,
-                max(6, math.ceil(core_duration / 60.0 * 8)),
+                clip_targets[chunk_index][1] if whole_film_writer else max(6, math.ceil(core_duration / 60.0 * 8)),
                 context={"outline": outline_window, "characters": compact_registry(rolling_character_registry),
                          "non_story_ranges": (full_video_outline or {}).get('non_story_ranges') or [],
-                         "previous_end_state": chunk_evidence[-1].get("end_state") if chunk_evidence else None,
+                         "previous_end_state": previous_evidence.get("end_state"),
                          "transcript": format_transcript_window(transcript_segments, chunk_start, chunk_end,
                                                                max_characters=20000)})
+            if whole_film_writer:
+                sentence_budget, fact_budget = clip_targets[chunk_index]
+                evidence_prompt += (
+                    f'\nVung chinh {adaptive_evidence_boundaries[chunk_index]:.2f}-'
+                    f'{adaptive_evidence_boundaries[chunk_number]:.2f}s du kien ke {sentence_budget} cau. '
+                    f'Tim khoang {fact_budget} observation rieng co SHOT trong vung chinh. '
+                    'Dung khoang overlap de noi mach, khong tinh vao muc tieu cua vung chinh. '
+                    'Voi moi tinh huong, ghi rieng quyet dinh duoc the hien, hanh dong, phan ung '
+                    'lam doi dien bien va ket qua neu moi buoc co bang chung rieng. '
+                    'Neu mot cau tong quat chua hai thay doi co the kiem chung doc lap, tach thanh hai '
+                    'observation voi SHOT tuong ung. Quet den cuoi vung chinh truoc khi tra ket qua. '
+                    '\nDoc tron dien bien trong clip. Uu tien cac SHOT chung minh tinh huong mo dau, '
+                    'hanh dong chinh, buoc ngoat va ket qua. Neu can nhieu shot, giu nhung shot cho thay '
+                    'cac buoc khac nhau; bo dong tac lap. Chi ghi viec nhan vat dang lam tren hinh. '
+                    'Ghi ro khi doi tuyen hoac doi thoi diem, va chi gan nguyen nhan khi co bang chung.')
+            if review_boundary:
+                evidence_prompt += (
+                    '\nDoi chieu ky cho noi voi doan truoc: xac minh nhan vat, hanh dong dang tiep dien '
+                    'va nguyen nhan-ket qua tu SHOT thuc te. Tra day du bang chung cho doan nay.')
+                append_task_log(task_id, 'INFO',
+                                f'Doan {chunk_number}: xem lai de noi mach voi doan truoc da khoi phuc.')
             normalized_evidence = None
             evidence_responses = []
-            if not evidence_text:
-                evidence_content = ensure_evidence_content(chunk_index, progress)
-                primary_observation_calls += 1
-                evidence_text = generate_gemini_text_with_recovery(
-                    client,
-                    analysis_model,
-                    [evidence_content, evidence_prompt],
-                    observation_config,
-                    f"Gemini trich xuat bang chung doan {chunk_number}",
-                    update_progress=lambda message, p=progress: update_prog(p, message),
-                    stream=True,
-                    # Never resend the expensive video merely to repair JSON.
-                    max_attempts=1,
-                    resume_503_forever=False,
-                    usage_callback=record_gemini_usage,
-                    quota_pacer=gemini_quota_pacer,
-                    estimated_input_tokens=estimate_gemini_video_input_tokens(
-                        chunk_duration, DETAIL_VIDEO_ANALYSIS_FPS
-                    ),
-                )
-            else:
-                append_task_log(task_id, 'INFO', f'Doan {chunk_number}: doc lai phan hoi goc da luu; khong upload/goi Gemini lai.')
-            evidence_responses.append(evidence_text)
-            with task_lock:
-                raw_observations = copy.deepcopy(TASKS.get(task_id, {}).get('primary_grounding_responses') or {})
-            raw_observations[str(chunk_number)] = evidence_text
-            update_task_fields(task_id, primary_grounding_responses=raw_observations)
-            persist_grounding_cache()  # Save the complete document before parsing.
-            def save_observation_attempt(text, attempt):
+            try:
+                if not evidence_text:
+                    evidence_content = ensure_evidence_content(chunk_index, progress)
+                    next_index = chunk_index + 1
+                    if (evidence_prefetch_executor is not None and next_index < len(evidence_paths)
+                            and prefetched_evidence is None and next_index == next_fresh
+                            and not raw_observations.get(str(next_index + 1))):
+                        prefetched_evidence = (
+                            next_index, evidence_prefetch_executor.submit(prepare_evidence_content, next_index))
+                    primary_observation_calls += 1
+                    evidence_text = generate_gemini_text_with_recovery(
+                        client,
+                        analysis_model,
+                        [evidence_content, evidence_prompt],
+                        detail_observation_config,
+                        f"Gemini trich xuat bang chung doan {chunk_number}",
+                        update_progress=lambda message, p=progress: update_prog(p, message),
+                        stream=True,
+                        # Never resend the expensive video merely to repair JSON.
+                        max_attempts=1,
+                        resume_503_forever=False, capacity_max_retries=0,
+                        usage_callback=record_gemini_usage,
+                        quota_pacer=gemini_quota_pacer,
+                        estimated_input_tokens=estimate_gemini_video_input_tokens(
+                            chunk_duration, evidence_frame_rates[chunk_index]
+                        ),
+                        **detail_retry_options,
+                    )
+                else:
+                    append_task_log(task_id, 'INFO', f'Doan {chunk_number}: doc lai phan hoi goc da luu; khong upload/goi Gemini lai.')
+                evidence_responses.append(evidence_text)
                 with task_lock:
-                    history = copy.deepcopy(TASKS.get(task_id, {}).get('grounding_recovery_responses') or {})
-                    latest = copy.deepcopy(TASKS.get(task_id, {}).get('primary_grounding_responses') or {})
-                history.setdefault(str(chunk_number), []).append({'attempt': attempt, 'text': text})
-                latest[str(chunk_number)] = text
-                update_task_fields(task_id, grounding_recovery_responses=history,
-                                   primary_grounding_responses=latest)
-                persist_grounding_cache()
+                    raw_observations = copy.deepcopy(TASKS.get(task_id, {}).get('primary_grounding_responses') or {})
+                raw_observations[raw_key] = evidence_text
+                update_task_fields(task_id, primary_grounding_responses=raw_observations)
+                persist_grounding_cache()  # Save the complete document before parsing.
+                def save_observation_attempt(text, attempt):
+                    with task_lock:
+                        history = copy.deepcopy(TASKS.get(task_id, {}).get('grounding_recovery_responses') or {})
+                        latest = copy.deepcopy(TASKS.get(task_id, {}).get('primary_grounding_responses') or {})
+                    history.setdefault(raw_key, []).append({'attempt': attempt, 'text': text})
+                    latest[raw_key] = text
+                    update_task_fields(task_id, grounding_recovery_responses=history,
+                                       primary_grounding_responses=latest)
+                    persist_grounding_cache()
 
-            def regenerate_observations(correction):
+                def regenerate_observations(correction):
+                    append_task_log(task_id, 'WARNING',
+                        f'Doan {chunk_number}: du lieu hoac SHOT ID khong hop le; Gemini se xem lai dung clip de doi chieu.',
+                        correction)
+                    return generate_gemini_text_with_recovery(
+                        client, analysis_model,
+                        [ensure_evidence_content(chunk_index, progress), evidence_prompt + '\n' + correction],
+                        detail_observation_config, f'Gemini doi chieu lai SHOT doan {chunk_number}',
+                        update_progress=lambda message, p=progress: update_prog(p, message),
+                        stream=True, max_attempts=1, resume_503_forever=False, capacity_max_retries=0,
+                        usage_callback=record_gemini_usage, quota_pacer=gemini_quota_pacer,
+                        estimated_input_tokens=estimate_gemini_video_input_tokens(
+                            chunk_duration, evidence_frame_rates[chunk_index]),
+                        **detail_retry_options)
+
+                indexed_payload = recover_observations(
+                    evidence_text, source_shot_index, chunk_start, chunk_end, chunk_number,
+                    regenerate_observations, save=save_observation_attempt)
+            except Exception as exc:
+                if not is_gemini_capacity_503_error(exc):
+                    raise
+                deferred_until[chunk_index] = time.monotonic() + capacity_retry_delay_seconds
                 append_task_log(task_id, 'WARNING',
-                    f'Doan {chunk_number}: du lieu hoac SHOT ID khong hop le; Gemini se xem lai dung clip de doi chieu.',
-                    correction)
-                return generate_gemini_text_with_recovery(
-                    client, analysis_model,
-                    [ensure_evidence_content(chunk_index, progress), evidence_prompt + '\n' + correction],
-                    observation_config, f'Gemini doi chieu lai SHOT doan {chunk_number}',
-                    update_progress=lambda message, p=progress: update_prog(p, message),
-                    stream=True, max_attempts=1, resume_503_forever=False,
-                    usage_callback=record_gemini_usage, quota_pacer=gemini_quota_pacer,
-                    estimated_input_tokens=estimate_gemini_video_input_tokens(
-                        chunk_duration, DETAIL_VIDEO_ANALYSIS_FPS))
-
-            indexed_payload = recover_observations(
-                evidence_text, source_shot_index, chunk_start, chunk_end, chunk_number,
-                regenerate_observations, save=save_observation_attempt)
+                    f'Gemini bao 503 o doan {chunk_number}; tu thu lai sau {capacity_retry_delay_seconds}s. '
+                    f'Da xac minh {final_count}/{total_evidence} doan.')
+                continue
             if indexed_payload.get('review_candidates'):
                 append_task_log(task_id, 'WARNING',
                     f'Doan {chunk_number}: con hanh dong chua xac minh; '
@@ -2701,7 +2897,24 @@ def _analyze_video_bg_once(
                 raise ValueError(f'GROUNDED_OBSERVATIONS_MISSING: doan {chunk_number}; '
                                  'phan hoi goc da luu, khong tu tao timestamp hay du kien thay the.')
             normalized_evidence['character_registry_version'] = CHARACTER_REGISTRY_VERSION
-            chunk_evidence.append(normalized_evidence)
+            evidence_by_index[chunk_index] = normalized_evidence
+            if missing_previous:
+                provisional.add(chunk_index)
+                append_task_log(task_id, 'INFO',
+                    f'Doan {chunk_number}: da luu tam; se doi chieu khi doan truoc hoan tat.')
+            else:
+                provisional.discard(chunk_index)
+                provisional_key = f'provisional:{chunk_number}'
+                with task_lock:
+                    saved_observations = copy.deepcopy(
+                        TASKS.get(task_id, {}).get('primary_grounding_responses') or {})
+                if provisional_key in saved_observations:
+                    del saved_observations[provisional_key]
+                    update_task_fields(task_id, primary_grounding_responses=saved_observations)
+                    persist_grounding_cache()
+            while completed_chunks in evidence_by_index and completed_chunks not in provisional:
+                chunk_evidence.append(evidence_by_index[completed_chunks])
+                completed_chunks += 1
             persistent_registry = character_registry(registry_outline, chunk_evidence,
                                                       transcript_segments=transcript_segments)
             update_task_fields(
@@ -2709,7 +2922,7 @@ def _analyze_video_bg_once(
                 chapter_evidence_checkpoint={
                     "character_registry_version": CHARACTER_REGISTRY_VERSION,
                     "evidence_contract_version": EVIDENCE_CONTRACT_VERSION,
-                    "completed": chunk_number,
+                    "completed": completed_chunks,
                     "total": len(evidence_paths),
                     "windows": expected_checkpoint_windows,
                     "evidence": copy.deepcopy(chunk_evidence),
@@ -2729,33 +2942,41 @@ def _analyze_video_bg_once(
             update_task_fields(task_id, character_registry_checkpoint={
                 'version': CHARACTER_REGISTRY_VERSION, 'characters': persistent_registry})
 
-        from grounded_pipeline import deduplicate_observations, supplement_observations, indexed_clip
+        from grounded_pipeline import deduplicate_observations, indexed_clip
+        from situation_recap import character_registry, bind_character_registry
         chunk_evidence, overlap_duplicates = deduplicate_observations(chunk_evidence)
+        gap_remote_files = {}
 
-        def extract_grounded_gap(start, end, deficit, attempt, focus=None):
+        def extract_grounded_gap(start, end, deficit, attempt, focus=None, split_depth=0):
             nonlocal grounded_gap_calls
             import hashlib
-            gap_key = hashlib.sha256(json.dumps([start, end, focus], sort_keys=True).encode()).hexdigest()
+            gap_fps = max((fps for left, right, fps in zip(
+                adaptive_evidence_boundaries, adaptive_evidence_boundaries[1:], evidence_frame_rates)
+                if start < right and end > left), default=DETAIL_VIDEO_ANALYSIS_FPS)
+            gap_signature = [start, end, focus]
+            if gap_fps != DETAIL_VIDEO_ANALYSIS_FPS:
+                gap_signature.append(gap_fps)
+            if whole_film_writer:
+                gap_signature.append(observation_version)
+            gap_key = hashlib.sha256(json.dumps(gap_signature, sort_keys=True).encode()).hexdigest()
             gap_chunk_number = 1000 + int(gap_key[:6], 16)
             with task_lock:
                 gap_cache = copy.deepcopy(TASKS.get(task_id, {}).get('grounded_gap_responses') or {})
             cached_gap = gap_cache.get(gap_key)
             if cached_gap:
-                bound = bind_observations(parse_observations(cached_gap), source_shot_index, start, end, gap_chunk_number)
+                try:
+                    parsed_gap = parse_observations(cached_gap)
+                except ValueError:
+                    cached_gap = None
+            if cached_gap:
+                bound = bind_observations(parsed_gap, source_shot_index, start, end, gap_chunk_number)
                 bound = bind_character_registry(bound, character_registry(registry_outline, chunk_evidence,
                     transcript_segments=transcript_segments),
                     identity_shot_ids={sid for sid, s in source_shot_index.items()
                         if s['start_seconds'] < end and s['end_seconds'] > start}, transcript_segments=transcript_segments)
                 return normalize_chunk_evidence(json.dumps(bound, ensure_ascii=False), start, end-start,
                     chunk_number=gap_chunk_number, primary_end_sec=end)['events']
-            path = os.path.join(upload_staging_dir, f'grounded_gap_{attempt}.mp4')
-            indexed_clip(video_path, path, start, end, ffmpeg_exe, fps=DETAIL_VIDEO_ANALYSIS_FPS)
-            remote = upload_gemini_file_with_recovery(client_upload, path, label='bo sung du kien co SHOT ID',
-                update_progress=lambda message: update_prog(35, message), max_attempts=3)
-            remote_files.append(remote)
-            wait_for_gemini_file(client, remote.name, max_wait_seconds=900, poll_interval=5,
-                sleep_fn=time.sleep, on_wait=lambda waited, limit: update_prog(
-                    35, f'Gemini dang xu ly clip bo sung... ({waited}s/{limit}s)'))
+            # Build context first so local dependency errors occur before media work.
             prompt = observation_prompt(1000 + attempt, start, end, deficit,
                 context={'known_facts': [f['text'] for c in chunk_evidence for e in c['events']
                                         if e.get('start_seconds', 0) < end and e.get('end_seconds', 0) > start
@@ -2765,36 +2986,64 @@ def _analyze_video_bg_once(
                          'characters': compact_registry(character_registry(registry_outline, chunk_evidence,
                              transcript_segments=transcript_segments)),
                          'transcript': format_transcript_window(transcript_segments, start, end, max_characters=4000),
-                         'instruction': 'Chi bo sung du kien MOI quan sat, khong lap known_facts.'})
+                         'instruction': 'Chi bo sung du kien MOI co bang chung, khong lap known_facts. '
+                             'Uu tien muc tieu, tro ngai, quyet dinh, manh moi, chuc nang bao boi, '
+                             'dao chieu va ket qua. Doi chieu transcript de tim thong tin con thieu. '
+                             'Khong them cu chi vo nghia de du so; neu khong co du thong tin moi thi tra it hon.'})
+            path = os.path.join(upload_staging_dir, f'grounded_gap_{gap_key}.mp4')
+            remote = gap_remote_files.get(gap_key)
+            if remote is None:
+                update_prog(35, f'Dang chuan bi clip bo sung {start:.0f}-{end:.0f}s')
+                indexed_clip(video_path, path, start, end, ffmpeg_exe, fps=gap_fps)
+                remote = upload_gemini_file_with_recovery(client_upload, path, label='bo sung du kien co SHOT ID',
+                    update_progress=lambda message: update_prog(35, message), max_attempts=3)
+                remote_files.append(remote)
+                wait_for_gemini_file(client, remote.name, max_wait_seconds=900, poll_interval=5,
+                    sleep_fn=time.sleep, on_wait=lambda waited, limit: update_prog(
+                        35, f'Gemini dang xu ly clip bo sung... ({waited}s/{limit}s)'))
+                gap_remote_files[gap_key] = remote
+            update_prog(35, f'Dang cho Gemini phan tich bo sung {start:.0f}-{end:.0f}s')
             grounded_gap_calls += 1
             response = generate_gemini_text_with_recovery(client, analysis_model,
-                [build_full_video_gemini_part(genai_types, remote, fps=DETAIL_VIDEO_ANALYSIS_FPS), prompt],
+                [build_full_video_gemini_part(genai_types, remote, fps=gap_fps), prompt],
                 observation_config, f'Gemini bo sung bang chung truoc ke hoach {attempt}',
-                update_progress=lambda message: update_prog(35, message), stream=True, max_attempts=1,
+                update_progress=lambda message: update_prog(35, message), stream=True, max_attempts=2,
+                capacity_max_retries=1, minute_quota_max_retries=0, capacity_retry_delays=(20,),
                 usage_callback=record_gemini_usage, quota_pacer=gemini_quota_pacer,
-                estimated_input_tokens=estimate_gemini_video_input_tokens(end-start, DETAIL_VIDEO_ANALYSIS_FPS))
-            with task_lock:
-                gap_responses = copy.deepcopy(TASKS.get(task_id, {}).get('grounded_gap_responses') or {})
-            gap_responses[gap_key] = response
-            update_task_fields(task_id, grounded_gap_responses=gap_responses)
-            bound = bind_observations(parse_observations(response), source_shot_index, start, end, gap_chunk_number)
+                estimated_input_tokens=estimate_gemini_video_input_tokens(end-start, gap_fps))
+            try:
+                parsed_gap = parse_observations(response)
+            except ValueError:
+                if split_depth >= 3 or end - start <= 12:
+                    raise
+                middle = (start + end) / 2
+                append_task_log(task_id, 'WARNING', 'JSON xem bu chua hoan chinh; chia doi cua so nguon.')
+                return (extract_grounded_gap(start, middle, max(1, deficit // 2), attempt, focus, split_depth + 1)
+                        + extract_grounded_gap(middle, end, max(1, deficit // 2), attempt, focus, split_depth + 1))
+            bound = bind_observations(parsed_gap, source_shot_index, start, end, gap_chunk_number)
             bound = bind_character_registry(bound, character_registry(registry_outline, chunk_evidence,
                 transcript_segments=transcript_segments),
                 identity_shot_ids={sid for sid, s in source_shot_index.items()
                     if s['start_seconds'] < end and s['end_seconds'] > start}, transcript_segments=transcript_segments)
-            return normalize_chunk_evidence(json.dumps(bound, ensure_ascii=False), start, end-start,
+            normalized_events = normalize_chunk_evidence(json.dumps(bound, ensure_ascii=False), start, end-start,
                 chunk_number=gap_chunk_number, primary_end_sec=end)['events']
+            with task_lock:
+                gap_responses = copy.deepcopy(TASKS.get(task_id, {}).get('grounded_gap_responses') or {})
+            gap_responses[gap_key] = response
+            update_task_fields(task_id, grounded_gap_responses=gap_responses)
+            return normalized_events
 
         # Duration is a prose budget, never a minimum number of visual facts.
         grounded_gap_calls = 0
         from plot_coverage import plot_coverage, missing_plot_windows, merge_plot_events
         with task_lock:
             plot_checkpoint = copy.deepcopy(TASKS.get(task_id, {}).get('plot_coverage_checkpoint') or {})
-        reviewed_plot_ids = list(plot_checkpoint.get('reviewed_ids') or [])
-        supplemental_events = list(plot_checkpoint.get('supplemental_events') or [])
+        reviewed_plot_ids = [] if whole_film_writer else list(plot_checkpoint.get('reviewed_ids') or [])
+        supplemental_events = [] if whole_film_writer else list(plot_checkpoint.get('supplemental_events') or [])
         merge_plot_events(chunk_evidence, supplemental_events)
         plot_report = plot_coverage(full_video_outline, chunk_evidence, video_duration_sec, reviewed_plot_ids)
-        plot_windows = missing_plot_windows(plot_report, budget=MAX_TARGETED_VISUAL_REVIEWS, max_seconds=60)
+        plot_windows = ([] if whole_film_writer else
+                        missing_plot_windows(plot_report, budget=MAX_TARGETED_VISUAL_REVIEWS, max_seconds=60))
         for plot_index, window in enumerate(plot_windows, 1):
             append_task_log(task_id, 'COVERAGE', 'Thieu nguon cho mat xich chinh; xem dung cua so ngan.',
                             json.dumps(window, ensure_ascii=False))
@@ -2813,33 +3062,75 @@ def _analyze_video_bg_once(
             'supplemental_events': supplemental_events, 'report': plot_report})
         append_task_log(task_id, 'COVERAGE', 'Doi chieu cot truyen truoc khi lap ke hoach.',
                         json.dumps(plot_report, ensure_ascii=False))
-        from evidence_inventory import inventory, detail_windows
+        from evidence_inventory import inventory, detail_windows, detail_review_record, detail_stop_reason
         before_detail = inventory(chunk_evidence)
         with task_lock:
             detail_checkpoint = copy.deepcopy(TASKS.get(task_id, {}).get('detail_review_checkpoint') or {})
-        detail_target = max(
-            budget['target_sentence_count'],
-            math.ceil(budget['target_sentence_count'] * 1.15),
-        )
+        detail_target = int(budget['target_sentence_count'])
+        from situation_recap import build_situation_plan
+        from narrative_contract import SentenceEvidenceShortage, allocate_sentences
+        from event_cluster_writer import cluster_plan
+        from narration_novelty import review_plan_novelty
+
+        def filter_whole_film_plan(plan):
+            return review_plan_novelty(
+                cluster_plan(plan, condense_details=True), lambda _: {'duplicates': []})
+
+        def check_detail_capacity():
+            probe = build_situation_plan(chunk_evidence, full_video_outline,
+                video_duration_sec, target_recap_words, single_timeline=True)
+            probe['evidence_capacity_policy'] = 'distinct_facts'
+            if whole_film_writer:
+                probe = filter_whole_film_plan(probe)
+            # Editorial selection can reduce the number of situations later.
+            # More situations than slots is not a reason to collect more video.
+            if not whole_film_writer and sum(map(len, probe['events_by_part'])) > detail_target:
+                return
+            allocated = allocate_sentences(probe, detail_target, target_recap_words)
+            return allocated['sentence_contract']['evidence_capacity']
+
+        def measure_detail_capacity():
+            try:
+                return check_detail_capacity(), None
+            except SentenceEvidenceShortage as exc:
+                return exc.capacity, exc
+            except ValueError as exc:
+                if str(exc).startswith(('SENTENCE_EVIDENCE_SHORTAGE', 'SITUATION_PLAN_INSUFFICIENT_EVIDENCE')):
+                    return 0, exc
+                raise
         compatible_detail_checkpoint = (
-            int(detail_checkpoint.get('evidence_contract_version') or 0) == EVIDENCE_CONTRACT_VERSION
+            bool(detail_checkpoint.get('whole_film_writer')) == whole_film_writer
+            and int(detail_checkpoint.get('evidence_contract_version') or 0) == EVIDENCE_CONTRACT_VERSION
             and int(detail_checkpoint.get('target_sentence_count') or 0)
                 == int(budget['target_sentence_count'])
         )
         detail_events = list(detail_checkpoint.get('events') or []) if compatible_detail_checkpoint else []
-        reviewed_detail_windows = list(detail_checkpoint.get('reviewed_windows') or []) if compatible_detail_checkpoint else []
+        reviewed_detail_windows = (list(detail_checkpoint.get('reviewed_windows') or [])
+            if compatible_detail_checkpoint and detail_checkpoint.get('review_policy_version') == 3 else [])
+        review_records = (copy.deepcopy(detail_checkpoint.get('windows') or {})
+                          if compatible_detail_checkpoint else {})
         merge_plot_events(chunk_evidence, detail_events)
         chunk_evidence, _ = deduplicate_observations(chunk_evidence)
 
-        # Keep reviewing the sparsest unvisited minutes until the evidence
-        # reserve can support the requested sentence contract.  There is no
-        # fixed three-window ceiling: in the worst case this walks the whole
-        # film once, still at the same 2-FPS observation rate.
-        detail_index = len(reviewed_detail_windows)
-        while inventory(chunk_evidence)['facts'] < detail_target:
+        # Plot gaps were reviewed above. Supplement sparse windows only if the
+        # grounded situations still cannot supply the mandatory sentence plan.
+        restored_detail_count = len(reviewed_detail_windows)
+        detail_index = restored_detail_count
+        attempted_detail_windows = list(reviewed_detail_windows)
+        stagnant_reviews, failed_reviews = 0, 0
+        detail_stop = None
+        detail_capacity, detail_error = measure_detail_capacity()
+        detail_ready = detail_error is None
+        review_outline = full_video_outline if whole_film_writer else None
+        append_task_log(task_id, 'INFO', 'Suc chua loi ke truoc khi xem bu.',
+                        json.dumps({'supported_sentences': detail_capacity, 'target_sentences': detail_target,
+                                    'facts': inventory(chunk_evidence)['facts'],
+                                    'restored_review_windows': len(reviewed_detail_windows)}))
+        while not detail_ready:
             windows = detail_windows(
-                chunk_evidence, video_duration_sec, detail_target,
-                limit=4, reviewed=reviewed_detail_windows,
+                chunk_evidence, video_duration_sec, inventory(chunk_evidence)['facts'] + 1,
+                limit=1, reviewed=attempted_detail_windows, prefer_story=whole_film_writer,
+                outline=review_outline,
             )
             if not windows:
                 break
@@ -2847,47 +3138,102 @@ def _analyze_video_bg_once(
                 detail_index += 1
                 key = [round(float(window['start_seconds']), 3),
                        round(float(window['end_seconds']), 3)]
-                reviewed_detail_windows.append(key)
+                attempted_detail_windows.append(key)
+                record_key = json.dumps(key)
+                before_facts = inventory(chunk_evidence)['facts']
                 append_task_log(task_id, 'INFO',
                     'Xem bu chi tiet vung cot truyen thua fact.',
                     json.dumps(dict(window,
                         evidence_target=detail_target,
                         current_facts=inventory(chunk_evidence)['facts']), ensure_ascii=False))
                 try:
-                    deficit = max(1, detail_target - inventory(chunk_evidence)['facts'])
+                    deficit = detail_target - detail_capacity
                     extra = extract_grounded_gap(
                         window['start_seconds'], window['end_seconds'],
                         min(16, max(8, deficit)), 100 + detail_index, focus=window)
                     merge_plot_events(chunk_evidence, extra)
                     detail_events.extend(extra)
                     chunk_evidence, _ = deduplicate_observations(chunk_evidence)
+                    added = max(0, inventory(chunk_evidence)['facts'] - before_facts)
+                    reviewed_detail_windows.append(key)
+                    review_records[record_key] = detail_review_record(window, review_records.get(record_key),
+                        status='completed' if added else 'no_new_evidence', new_facts=added)
+                    failed_reviews = 0
                 except Exception as detail_error:
+                    review_records[record_key] = detail_review_record(window, review_records.get(record_key),
+                        status='failed', error=detail_error)
+                    update_task_fields(task_id, detail_review_checkpoint={
+                        'review_policy_version': 3, 'whole_film_writer': whole_film_writer,
+                        'evidence_contract_version': EVIDENCE_CONTRACT_VERSION,
+                        'target_sentence_count': int(budget['target_sentence_count']),
+                        'evidence_target': int(detail_target), 'completed': False,
+                        'reviewed_windows': reviewed_detail_windows, 'windows': review_records, 'events': detail_events})
+                    if isinstance(detail_error, (NameError, UnboundLocalError, TypeError, AttributeError)):
+                        raise
                     if is_daily_project_gemini_quota_error(detail_error) or is_gemini_auth_error(detail_error):
                         raise
                     append_task_log(task_id, 'WARNING',
                         'Xem bu chi tiet chua thanh cong; se tiep tuc cac vung thua khac.',
                         str(detail_error))
+                    failed_reviews += 1
+                previous_capacity = detail_capacity
+                detail_capacity, detail_error = measure_detail_capacity()
+                detail_ready = detail_error is None
+                if review_records[record_key]['status'] != 'failed':
+                    improved = detail_capacity > previous_capacity if whole_film_writer else added > 0
+                    stagnant_reviews = 0 if improved else stagnant_reviews + 1
+                    detail_progress = (f'co bang chung cho {detail_capacity} cau (muc tieu {detail_target})'
+                                       if detail_capacity is not None else f'them {added} fact')
+                    update_prog(35, f'Xem bu xong {len(reviewed_detail_windows)} vung; {detail_progress}')
                 update_task_fields(task_id, detail_review_checkpoint={
+                    'review_policy_version': 3, 'windows': review_records, 'whole_film_writer': whole_film_writer,
                     'evidence_contract_version': EVIDENCE_CONTRACT_VERSION,
                     'target_sentence_count': int(budget['target_sentence_count']),
                     'evidence_target': int(detail_target),
-                    'completed': inventory(chunk_evidence)['facts'] >= detail_target,
+                    'completed': detail_ready,
                     'reviewed_windows': reviewed_detail_windows,
                     'events': detail_events,
                 })
-                if inventory(chunk_evidence)['facts'] >= detail_target:
+                detail_stop = detail_stop_reason(detail_capacity if whole_film_writer else inventory(chunk_evidence)['facts'],
+                    budget['target_sentence_count'], stagnant_reviews, failed_reviews)
+                if detail_stop:
+                    append_task_log(task_id, 'WARNING',
+                        'Dung vong xem bu vi khong co tien trien; giu kho bang chung va kiem tra ngan sach bat buoc.',
+                        detail_stop)
                     break
+                if detail_ready:
+                    break
+            if detail_stop:
+                break
         update_task_fields(task_id, detail_review_checkpoint={
+            'review_policy_version': 3, 'windows': review_records, 'stop_reason': detail_stop,
+            'whole_film_writer': whole_film_writer,
             'evidence_contract_version': EVIDENCE_CONTRACT_VERSION,
             'target_sentence_count': int(budget['target_sentence_count']),
             'evidence_target': int(detail_target),
-            'completed': inventory(chunk_evidence)['facts'] >= detail_target,
-            'exhausted': not detail_windows(
-                chunk_evidence, video_duration_sec, detail_target,
-                limit=1, reviewed=reviewed_detail_windows),
+            'completed': detail_ready,
+            'exhausted': not detail_ready and not detail_windows(
+                chunk_evidence, video_duration_sec, inventory(chunk_evidence)['facts'] + 1,
+                limit=1, reviewed=reviewed_detail_windows, prefer_story=whole_film_writer,
+                outline=review_outline),
             'reviewed_windows': reviewed_detail_windows,
             'events': detail_events,
         })
+        append_task_log(task_id, 'INFO', 'Suc chua loi ke sau khi xem bu.',
+                        json.dumps({'supported_sentences': detail_capacity, 'target_sentences': detail_target,
+                                    'reviewed_windows': len(reviewed_detail_windows),
+                                    'attempted_windows_this_run': detail_index - restored_detail_count,
+                                    'stop_reason': detail_stop}))
+        if not detail_ready:
+            raise detail_error
+        if whole_film_writer:
+            pending_windows = detail_windows(
+                chunk_evidence, video_duration_sec, inventory(chunk_evidence)['facts'] + 1,
+                limit=1, prefer_story=True, outline=review_outline)
+            if pending_windows and pending_windows[0]['reason'] == 'possible_missing_resolution':
+                append_task_log(task_id, 'WARNING',
+                    'Con khoang chuyen sang ket qua chua duoc quan sat day du; chi ke bang chung da xac nhan.',
+                    json.dumps(pending_windows[0], ensure_ascii=False))
         append_task_log(task_id, 'INFO', 'Kho bang chung truoc/sau xem bu chi tiet.',
                         json.dumps({'before': before_detail, 'after': inventory(chunk_evidence)}, ensure_ascii=False))
         grounded_fact_count = sum(len(e.get('grounded_facts') or [])
@@ -3011,111 +3357,11 @@ def _analyze_video_bg_once(
         # Keep the visual budget at the three primary uploads. Boundary overlap
         # plus Whisper handle uncertainty; reopening extra reels here previously
         # multiplied quota use and made long jobs unpredictable.
-        review_candidates = []
-        review_windows = []
-        if not coverage["has_terminal_ending"]:
-            ending_candidates = [
-                row for row in review_candidates
-                if "ending" in str(row.get("reason", "")).lower()
-                or float(row.get("end_seconds", 0.0))
-                >= video_duration_sec * 0.9
-            ]
-            if ending_candidates:
-                review_windows.append(ending_candidates[-1])
-        if unresolved_boundaries and len(review_windows) < MAX_TARGETED_VISUAL_REVIEWS:
-            unresolved_ids = {str(value).upper() for value in unresolved_boundaries}
-            boundary_candidate = next((
-                row for row in review_candidates
-                if unresolved_ids & {
-                    str(value).upper() for value in (row.get("evidence_ids") or [])
-                }
-            ), None)
-            if boundary_candidate is not None and boundary_candidate not in review_windows:
-                review_windows.append(boundary_candidate)
-        review_windows = review_windows[:max(0, MAX_TARGETED_VISUAL_REVIEWS - evidence_replenishment_calls)]
-        for review_index, window in enumerate(review_windows, start=1):
-            start = float(window["start_seconds"])
-            end = float(window["end_seconds"])
-            review_path = os.path.join(
-                upload_staging_dir, f"evidence_review_{review_index:02d}.mp4"
-            )
-            review_result = subprocess.run([
-                ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error",
-                "-ss", f"{start:.3f}", "-i", upload_path,
-                "-t", f"{max(0.1, end - start):.3f}",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "30",
-                "-c:a", "aac", "-b:a", "48k", "-movflags", "+faststart",
-                review_path,
-            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if review_result.returncode != 0 or not os.path.isfile(review_path):
-                append_task_log(
-                    task_id, "WARNING",
-                    f"Khong cat duoc cua so kiem chung {start:.1f}-{end:.1f}s; "
-                    "giu danh tinh o trang thai chua xac dinh.",
-                )
-                continue
-            progress = 35 + int(3 * review_index / max(1, len(review_windows)))
-            update_prog(
-                progress,
-                f"Dang xem lai diem mau thuan {review_index}/{len(review_windows)}...",
-            )
-            review_file = upload_gemini_file_with_recovery(
-                client_upload,
-                review_path,
-                label=f"kiem chung {review_index}",
-                update_progress=lambda message, p=progress: update_prog(p, message),
-                max_attempts=3,
-            )
-            remote_files.append(review_file)
-            wait_for_gemini_file(
-                client,
-                review_file.name,
-                max_wait_seconds=900,
-                poll_interval=5,
-                sleep_fn=time.sleep,
-                on_wait=lambda waited, limit, p=progress: update_prog(
-                    p, f"Gemini dang xem lai diem mau thuan... ({waited}s/{limit}s)"
-                ),
-            )
-            review_content = build_full_video_gemini_part(
-                genai_types, review_file, fps=DETAIL_VIDEO_ANALYSIS_FPS
-            )
-            review_prompt = build_evidence_review_prompt(
-                window, audit, chunk_evidence
-            )
-            review_text = generate_gemini_text_with_recovery(
-                client,
-                analysis_model,
-                [review_content, review_prompt],
-                pass1_config,
-                f"Gemini xac minh mau thuan {review_index}",
-                update_progress=lambda message, p=progress: update_prog(p, message),
-                stream=True,
-                max_attempts=1,
-                resume_503_forever=False,
-                usage_callback=record_gemini_usage,
-                quota_pacer=gemini_quota_pacer,
-                estimated_input_tokens=estimate_gemini_video_input_tokens(
-                    end - start, DETAIL_VIDEO_ANALYSIS_FPS
-                ),
-            )
-            review_payload = parse_json_object(review_text)
-            review_payload["_review_window"] = {
-                "start_seconds": start,
-                "end_seconds": end,
-                "allow_missing_events": bool(window.get("objective_gap")),
-            }
-            verification_texts.append(json.dumps(
-                review_payload, ensure_ascii=False
-            ))
-            evidence_audit_calls += 1
-
         remaining_review_budget = max(
-            0, MAX_TARGETED_VISUAL_REVIEWS - evidence_replenishment_calls - len(review_windows)
+            0, MAX_TARGETED_VISUAL_REVIEWS - evidence_replenishment_calls
         )
-        identity_comparisons = (audit.get("identity_comparisons") or [])[
-            :remaining_review_budget
-        ]
+        identity_comparisons = ([] if whole_film_writer else
+                                (audit.get("identity_comparisons") or [])[:remaining_review_budget])
         for comparison_index, comparison in enumerate(identity_comparisons, start=1):
             comparison_clips = []
             for interval_index, (start_key, end_key) in enumerate((
@@ -3250,14 +3496,19 @@ def _analyze_video_bg_once(
             "INFO",
             f"Kiem dinh toan phim: {len(audit.get('canonical_characters') or [])} "
             f"nhan vat chuan, {len(audit.get('contradictions') or [])} mau thuan, "
-            f"{len(review_windows)} cua so xem lai, {unresolved_count} danh tinh chua chac chan.",
+            f"{len(verification_texts)} phan hoi doi chieu, {unresolved_count} danh tinh chua chac chan.",
         )
 
         append_task_log(task_id, "INFO", "Dung lai shot tu luot xem chinh; khong kiem chung lai hang loat canh.")
         update_task_fields(task_id, visual_analysis_status="ready")
         update_prog(49, "Da xem xong hinh anh; dang hop nhat transcript vao evidence...")
+        excluded_shots = [shot for chunk in chunk_evidence
+                          for shot in chunk.get('confirmed_non_story_shots') or []]
+        story_transcript = [line for line in transcript_segments if not any(
+            line['start_seconds'] < shot['end_seconds'] and line['end_seconds'] > shot['start_seconds']
+            for shot in excluded_shots)]
         chunk_evidence, transcript_links = attach_transcript_to_evidence(
-            chunk_evidence, transcript_segments
+            chunk_evidence, story_transcript
         )
         update_task_fields(
             task_id,
@@ -3300,7 +3551,7 @@ def _analyze_video_bg_once(
             style,
             evidence_event_count,
             planning_version=2,
-            workflow_version=11,
+            workflow_version=story_workflow_version,
         )
         story_plan_model_used = str(
             saved_story_checkpoint.get("generated_model")
@@ -3339,7 +3590,7 @@ def _analyze_video_bg_once(
             story_plan_checkpoint={
                 "evidence_contract_version": EVIDENCE_CONTRACT_VERSION,
                 "planning_version": 2,
-                "workflow_version": 11,
+                "workflow_version": story_workflow_version,
                 "plan": copy.deepcopy(story_plan),
                 "video_name": video_filename,
                 "target_words": int(target_recap_words),
@@ -3356,37 +3607,134 @@ def _analyze_video_bg_once(
         from grounded_pipeline import lock_plan_visuals
         from narrative_contract import allocate_sentences
         story_plan['evidence_capacity_policy'] = 'distinct_facts'
-        from narration_novelty import review_plan_novelty
-        def review_narration_facts(prompt):
-            nonlocal pass1_calls
+        from narration_novelty import review_duplicates_with_ollama, review_plan_novelty
+        novelty_review_unavailable = False
+        novelty_attempted_ollama = False
+        novelty_used_ollama = False
+        ollama_unavailable = False
+        def review_narration_facts(prompt, *, duplicate_only=False):
+            nonlocal pass1_calls, novelty_review_unavailable, novelty_attempted_ollama
+            nonlocal novelty_used_ollama, ollama_unavailable
             from hashlib import sha256
             from recap_visual_media import parse_writing_response
             review_key = sha256(json.dumps([1, selected_model, prompt], ensure_ascii=False).encode()).hexdigest()
             with task_lock:
                 review_cache = copy.deepcopy(TASKS.get(task_id, {}).get('novelty_review_checkpoint') or {})
+                split_requests = copy.deepcopy(TASKS.get(task_id, {}).get('editorial_split_requests') or {})
             if review_key in review_cache:
                 return review_cache[review_key]
+            if review_key in split_requests:
+                raise ValueError('VISUAL_WRITING_JSON_INVALID: cached incomplete response; split this batch')
+            if novelty_review_unavailable and not duplicate_only:
+                return {'duplicates': []}
             pass1_calls += 1
             config = writing_config.model_copy(update={
                 'temperature': 0.0, 'response_schema': None,
+                'max_output_tokens': 8192,
                 'response_json_schema': {'type': 'object', 'properties': {
                     'duplicates': {'type': 'array', 'items': {'type': 'object', 'properties': {
                         'fact_id': {'type': 'string'}, 'retained_fact_id': {'type': 'string'},
                         'same_occurrence': {'type': 'boolean'}, 'adds_information': {'type': 'boolean'}},
-                        'required': ['fact_id', 'retained_fact_id', 'same_occurrence', 'adds_information']}}},
+                        'required': ['fact_id', 'retained_fact_id', 'same_occurrence', 'adds_information']}},
+                    'omit_fact_ids': {'type': 'array', 'items': {'type': 'string'}},
+                    'sentence_ideas': {'type': 'array', 'items': {'type': 'object', 'properties': {
+                        'event_id': {'type': 'string'}, 'purpose': {'type': 'string'},
+                        'role': {'type': 'string'}, 'importance': {'type': 'integer'},
+                        'fact_ids': {'type': 'array', 'items': {'type': 'string'}}},
+                        'required': ['event_id', 'purpose', 'role', 'importance', 'fact_ids']}},
+                    'story_spine': {'type': 'array', 'items': {'type': 'object', 'properties': {
+                        'event_id': {'type': 'string'}, 'summary': {'type': 'string'},
+                        'phase': {'type': 'string', 'enum': ['setup', 'development', 'climax', 'ending']},
+                        'fact_ids': {'type': 'array', 'items': {'type': 'string'}}},
+                        'required': ['event_id', 'summary', 'fact_ids']}}},
                     'required': ['duplicates']}})
-            raw = generate_gemini_text_with_recovery(
-                client, selected_model, [prompt], config, 'Kiem tra dien bien trung truoc khi chia cau',
-                stream=True, max_attempts=2, capacity_max_retries=0, retry_timeouts=False,
-                minute_quota_max_retries=0, usage_callback=record_gemini_usage,
-                quota_pacer=gemini_quota_pacer)
-            response = parse_writing_response(raw)
+            try:
+                raw = generate_gemini_text_with_recovery(
+                    client, selected_model, [prompt], config, 'Kiem tra dien bien trung truoc khi chia cau',
+                    stream=True, max_attempts=2, capacity_max_retries=0 if duplicate_only else 1,
+                    retry_timeouts=True,
+                    minute_quota_max_retries=0, usage_callback=record_gemini_usage,
+                    quota_pacer=gemini_quota_pacer)
+            except Exception as exc:
+                if not is_gemini_capacity_503_error(exc):
+                    raise
+                if duplicate_only:
+                    if ollama_unavailable:
+                        return {'duplicates': []}
+                    append_task_log(task_id, 'INFO',
+                                    'Gemini bao 503; chuyen nhom loc trung sang Ollama qwen3:4b.')
+                    schema = config.response_json_schema
+                    duplicate_schema = {'type': 'object', 'required': ['duplicates'],
+                                        'properties': {'duplicates': schema['properties']['duplicates']}}
+                    novelty_attempted_ollama = True
+                    try:
+                        result = review_duplicates_with_ollama(prompt, duplicate_schema)
+                    except (OSError, ValueError, TypeError, KeyError) as local_error:
+                        ollama_unavailable = isinstance(local_error, OSError)
+                        append_task_log(task_id, 'WARNING',
+                                        'Ollama khong tra duoc ket qua loc trung; giu chi tiet cua nhom.',
+                                        str(local_error))
+                        return {'duplicates': []}
+                    novelty_used_ollama = True
+                    return dict(result, _ollama_review=True)
+                novelty_review_unavailable = True
+                append_task_log(task_id, 'WARNING',
+                    'Gemini qua tai khi kiem tra dien bien trung. '
+                    'Dung ket qua da co va loc trung cuc bo cho cac nhom con lai.')
+                return {'duplicates': []}
+            try:
+                response = parse_writing_response(raw)
+            except ValueError as parse_error:
+                split_requests[review_key] = dict(error=str(parse_error), output_chars=len(raw))
+                update_task_fields(task_id, editorial_split_requests=split_requests)
+                append_task_log(task_id, 'WARNING',
+                    'JSON bien tap chua hoan chinh; chia nho nhom loi va giu cac nhom da luu.',
+                    str(parse_error))
+                raise
             if not isinstance(response, dict) or not isinstance(response.get('duplicates'), list):
                 raise ValueError('NARRATION_NOVELTY_REVIEW_INVALID')
             review_cache[review_key] = response
             update_task_fields(task_id, novelty_review_checkpoint=review_cache)
             return response
-        story_plan = review_plan_novelty(story_plan, review_narration_facts)
+        story_plan = (filter_whole_film_plan(story_plan) if whole_film_writer
+                      else cluster_plan(story_plan))
+        from coherent_recap import editorial_plan
+        story_plan['required_sentence_count'] = budget['target_sentence_count']
+        from hashlib import sha256
+        editorial_key = sha256(json.dumps([
+            'editorial_pipeline_v1', story_plan, selected_model, thinking_effort
+        ], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        with task_lock:
+            editorial_checkpoint = TASKS.get(task_id, {}).get('editorial_plan_checkpoint') or {}
+            cached_editorial = (copy.deepcopy(editorial_checkpoint.get('plan'))
+                                if editorial_checkpoint.get('key') == editorial_key else None)
+        if whole_film_writer:
+            story_plan['editorial_selection'] = {}
+            story_plan['editorial_story_spine'] = []
+        elif cached_editorial:
+            story_plan = cached_editorial
+            append_task_log(task_id, 'INFO', 'Dung lai ke hoach bien tap da hoan thanh tu checkpoint.')
+        else:
+            story_plan = review_plan_novelty(
+                story_plan, lambda prompt: review_narration_facts(prompt, duplicate_only=True))
+            story_plan = editorial_plan(story_plan, review_narration_facts)
+            if (not novelty_review_unavailable and not novelty_attempted_ollama
+                    and story_plan.get('editorial_story_spine')):
+                update_task_fields(task_id, editorial_plan_checkpoint={
+                    'key': editorial_key, 'plan': story_plan})
+        update_task_fields(task_id, editorial_selection=copy.deepcopy(story_plan['editorial_selection']),
+                           editorial_story_spine=copy.deepcopy(story_plan['editorial_story_spine']))
+        if story_plan.get('editorial_story_spine'):
+            editorial_events = [e for group in story_plan['events_by_part'] for e in group]
+            append_task_log(task_id, 'INFO',
+                f'Bien tap toan phim: {len(editorial_events)} su kien, '
+                f'giu bat buoc {budget["target_sentence_count"]} cau; luoc cu chi phu truoc khi viet.')
+        elif not whole_film_writer:
+            append_task_log(task_id, 'WARNING',
+                'Chua nhan duoc mach bien tap co bang chung tu API; giu ke hoach nguon. '
+                'Lan chay nay chua hoan tat buoc bien tap toan phim.')
+        story_plan['narration_novelty']['provider_fallback'] = novelty_review_unavailable
+        story_plan['narration_novelty']['ollama_used'] = novelty_used_ollama
         update_task_fields(task_id, narration_novelty=copy.deepcopy(story_plan['narration_novelty']))
         append_task_log(task_id, 'INFO',
             'Loc fact lap trong cung dien bien truoc khi phan bo lai DUNG tong so cau; '
@@ -3405,18 +3753,37 @@ def _analyze_video_bg_once(
         append_task_log(task_id, 'INFO',
             f'Backend da khoa chi muc {len(story_plan.get("source_shot_inventory") or [])} '
             'vung SHOT toan phim; chi fact da quan sat moi duoc phep chon hinh.')
+        from narrative_first import shot_archive
+        append_task_log(task_id, 'INFO',
+            '[SHOT_ARCHIVE] Luu toan bo chi muc, anh dai dien va quan sat goc de tra cuu lai.')
+        archive = shot_archive(story_plan, chunk_evidence, video_path, os.path.join(os.path.dirname(os.path.abspath(__file__)), '.cache'), ffmpeg_exe)
+        update_task_fields(task_id, source_shot_archive=archive)
+        append_task_log(task_id, 'INFO', '[SHOT_ARCHIVE] Da luu kho hinh nguon.',
+                        json.dumps(archive, ensure_ascii=False))
         from evidence_writer import build_sentence_plan
         story_plan = build_sentence_plan(story_plan)
-        from flat_writer import writer_format
-        if writer_format() == 'flat':
+        if recap_format in ('flat', 'whole_film'):
             from narration_units import plan_narration_units
             story_plan = plan_narration_units(story_plan)
+            from event_cluster_writer import prepare_plan
+            story_plan['draft_target_seconds'] = float(budget['target_minutes']) * 60
+            story_plan = prepare_plan(story_plan, lock_evidence=True)
+            update_task_fields(task_id, visual_draft_checkpoint={}, event_cluster_writer_version=2)
             update_task_fields(task_id, narration_unit='source_backed_unit',
                                narration_unit_version=1)
             append_task_log(task_id, 'INFO',
                 f'Muc tieu {budget["target_sentence_count"]} DON VI LOI KE co ID va hinh nguon; khong dem dau cham/phay.')
         from transition_contract import apply_transition_contracts
-        story_plan = apply_transition_contracts(story_plan)
+        with open(archive['path'], encoding='utf-8') as archive_file:
+            story_plan = apply_transition_contracts(story_plan, json.load(archive_file))
+        if whole_film_writer:
+            from narrative_first import visual_first_plan
+            draft = visual_first_plan(story_plan)['visual_draft']
+            draft['mode'] = 'whole_film'
+            update_task_fields(task_id, visual_draft_checkpoint=draft)
+        from coherent_recap import story_outline, upcoming_story_context
+        whole_story_outline = story_outline(story_plan)
+        upcoming_context = upcoming_story_context(story_plan)
         transition_counts = {}
         for transition_event in (event for transition_group in story_plan['events_by_part']
                                  for event in transition_group):
@@ -3436,7 +3803,8 @@ def _analyze_video_bg_once(
                 'Da sap nhom hinh theo thu tu nguon truoc khi viet doan ke.')
         with task_lock:
             grounded_story_checkpoint = copy.deepcopy(TASKS.get(task_id, {}).get('story_plan_checkpoint') or {})
-        grounded_story_checkpoint['plan'] = copy.deepcopy(story_plan)
+        if not whole_film_writer:
+            grounded_story_checkpoint['plan'] = copy.deepcopy(story_plan)
         update_task_fields(task_id, story_plan_checkpoint=grounded_story_checkpoint,
                            grounded_plan_checkpoint=copy.deepcopy(story_plan))
         append_task_log(task_id, 'INFO', 'Da khoa cac tinh huong va nhom hinh nguon; moi doan ke duoc dung nhieu canh.')
@@ -3529,7 +3897,7 @@ def _analyze_video_bg_once(
             task_id,
             locked_scene_contract=copy.deepcopy(scene_contract),
         )
-        update_prog(42, "Da khoa fact+shot va ke hoach cau; chuan bi viet bang van ban...")
+        update_prog(42, "Da lap mach phim va kho bang chung; chuan bi viet recap...")
         plan_event_ids = [
             str(event.get("event_id", "")).strip().upper()
             for events in (story_plan.get("events_by_part") or [])
@@ -3540,6 +3908,7 @@ def _analyze_video_bg_once(
             saved_part_checkpoint = copy.deepcopy(
                 TASKS.get(task_id, {}).get("part_writing_checkpoint") or {}
             )
+        recap_visual_alignment_version = {'whole_film': 17, 'flat': 10, 'legacy': 9}[recap_format]
         part_responses = resumable_part_responses(
             saved_part_checkpoint,
             boundaries,
@@ -3549,7 +3918,7 @@ def _analyze_video_bg_once(
             thinking_effort,
             style,
             plan_event_ids,
-            visual_alignment_version=8,
+            visual_alignment_version=recap_visual_alignment_version,
         )
         from evidence_writer import has_direct_dialogue
         for part_index, saved_part in enumerate(part_responses):
@@ -3810,39 +4179,48 @@ def _analyze_video_bg_once(
                     update_task_fields(task_id, grounded_narration_audit=copy.deepcopy(state))
 
                 source_stat = os.stat(video_path)
+                from source_fact_repair import refresh_reviewed_sources
+                payload = refresh_reviewed_sources(payload, required_events)
                 checked = audit_planned_payload(payload, check_text, check, text_cache=text_cache,
                     video_cache=grounded_audit_cache, save_text=save_text, save_video=save_video,
                     cache_only=cache_only, source_identity=[os.path.realpath(video_path),
                         source_stat.st_size, source_stat.st_mtime_ns], source_offset=source_offset,
-                    diagnostic=diagnostic)
+                    diagnostic=diagnostic,
+                    event_region_mode=bool(required_events) and all(
+                        e.get('event_cluster_writer_version') == 2 for e in required_events))
                 if not cache_only:
-                    from source_fact_repair import review_prompt, reviewed_event, coherent_repair_context
+                    from source_fact_repair import review_prompt, reviewed_event, coherent_repair_context, needs_source_review, source_review_key
                     from evidence_writer import write_batch, writing_prompt, writing_schema
                     from flat_writer import flat_prompt, flat_schema, flat_to_paragraphs, writer_format
                     scenes = [s for p in checked['parts'] for s in p.get('scenes') or []]
                     for scene in scenes:
                         sid = scene['scene_id']
-                        if (scene.get('grounding_audit_method') != 'video'
-                                or scene.get('grounding_audit_pending')
-                                or scene.get('grounding_audit_passed')
-                                or sid in source_fact_review_attempted):
+                        if not needs_source_review(scene) or sid in source_fact_review_attempted:
                             continue
                         source_fact_review_attempted.add(sid)
                         event = next((e for e in required_events if e.get('scene_id') == sid), None)
                         if not event:
                             continue
                         try:
-                            media, manifest, _ = ensure_visual_pack(
-                                [scene], source_offset, 'Xem lai fact mau thuan ' + sid)
-                            with visual_call_lock:
-                                pass1_calls += 1
-                            raw = generate_gemini_text_with_recovery(
-                                visual_client, selected_model, [media, review_prompt(event, manifest)],
-                                writing_config, 'Xem lai du kien goc ' + sid,
-                                stream=True, max_attempts=1, capacity_max_retries=0,
-                                retry_timeouts=False, minute_quota_max_retries=0,
-                                usage_callback=record_gemini_usage, quota_pacer=gemini_quota_pacer)
-                            revised = reviewed_event(event, parse_json_object(raw))
+                            review_key = source_review_key(event, [os.path.realpath(video_path), source_stat.st_size, source_stat.st_mtime_ns])
+                            with task_lock:
+                                reviews = copy.deepcopy(TASKS.get(task_id, {}).get('source_fact_review_checkpoint') or {})
+                            review = reviews.get(review_key)
+                            if review is None:
+                                media, manifest, _ = ensure_visual_pack(
+                                    [scene], source_offset, 'Xem lai fact mau thuan ' + sid)
+                                with visual_call_lock:
+                                    pass1_calls += 1
+                                raw = generate_gemini_text_with_recovery(
+                                    visual_client, selected_model, [media, review_prompt(event, manifest, story_plan.get('characters') or [])],
+                                    writing_config, 'Xem lai du kien goc ' + sid,
+                                    stream=True, max_attempts=1, capacity_max_retries=0,
+                                    retry_timeouts=False, minute_quota_max_retries=0,
+                                    usage_callback=record_gemini_usage, quota_pacer=gemini_quota_pacer)
+                                review = parse_json_object(raw)
+                            revised = reviewed_event(event, review, story_plan.get('characters') or [])
+                            reviews[review_key] = review
+                            update_task_fields(task_id, source_fact_review_checkpoint=reviews)
                             diagnostic('SOURCE_FACT_REVIEW', {'scene_id': sid,
                                 'old_facts': event['observed_facts'],
                                 'reviewed_facts': revised['observed_facts']})
@@ -3854,6 +4232,31 @@ def _analyze_video_bg_once(
                                         item.update(copy.deepcopy(revised))
                             event.update(copy.deepcopy(revised))
                             locked_event_by_id[event['event_id']].update(copy.deepcopy(revised))
+                            for anchor in story_plan.get('editorial_story_spine') or []:
+                                if anchor.get('event_id') == event['event_id']:
+                                    anchor['summary'] = revised['event']
+                            from transition_contract import apply_transition_contracts
+                            refreshed = apply_transition_contracts(story_plan)
+                            refreshed_events = {e['event_id']: e for group in refreshed['events_by_part'] for e in group}
+                            for group in story_plan['events_by_part']:
+                                for item in group:
+                                    item['transition_contract'] = copy.deepcopy(refreshed_events[item['event_id']]['transition_contract'])
+                                    item['sentence_slots'] = copy.deepcopy(refreshed_events[item['event_id']].get('sentence_slots') or [])
+                            for item in required_events:
+                                if item['event_id'] in refreshed_events:
+                                    item['transition_contract'] = copy.deepcopy(refreshed_events[item['event_id']]['transition_contract'])
+                            for current_scene in scenes:
+                                old_contract = current_scene.get('transition_contract') or {}
+                                affected = (current_scene['scene_id'] == sid
+                                    or old_contract.get('previous_event_id') == event['event_id']
+                                    or any(state.get('event_id') == event['event_id']
+                                           for state in (old_contract.get('returning_actor_states') or {}).values()))
+                                if affected:
+                                    source_event = next((item for item in required_events
+                                                         if item.get('scene_id') == current_scene['scene_id']), None)
+                                    if source_event:
+                                        current_scene['transition_contract'] = copy.deepcopy(source_event['transition_contract'])
+                            revised = copy.deepcopy(event)
                             with task_lock:
                                 plan_checkpoint = copy.deepcopy(TASKS.get(task_id, {}).get('story_plan_checkpoint') or {})
                             plan_checkpoint['plan'] = copy.deepcopy(story_plan)
@@ -3862,24 +4265,46 @@ def _analyze_video_bg_once(
                             context = coherent_repair_context(scenes, sid,
                                 dict(story_context, style=style, custom_prompt=custom_prompt))
                             flat = writer_format() == 'flat'
+                            from coherent_recap import story_prompt
+                            from writer_contract import decode as decode_writer, schema as writer_schema
+                            match_after_writing = bool(revised.get('narrative_first_version'))
+                            if match_after_writing:
+                                from coherent_recap import story_outline
+                                whole_story_outline[:] = story_outline(story_plan)
+                                context['whole_story_outline'] = whole_story_outline
                             def rewrite_reviewed(request_events, prompt):
                                 nonlocal pass1_calls
                                 pass1_calls += 1
-                                schema = (flat_schema if flat else writing_schema)(request_events)
+                                schema = (writer_schema if match_after_writing else
+                                          flat_schema if flat else writing_schema)(request_events)
                                 config = writing_config.model_copy(update={
                                     'temperature': 0.2, 'response_schema': None,
                                     'response_json_schema': schema})
-                                return generate_gemini_text_with_recovery(
+                                raw = generate_gemini_text_with_recovery(
                                     client, selected_model, [prompt], config,
                                     'Sua mach ke tu fact da xem lai ' + sid,
                                     stream=True, max_attempts=1, capacity_max_retries=0,
                                     retry_timeouts=False, minute_quota_max_retries=0,
                                     usage_callback=record_gemini_usage, quota_pacer=gemini_quota_pacer)
-                            repaired = write_batch([revised], context, rewrite_reviewed,
-                                characters=story_plan.get('characters') or [],
-                                prompt_builder=flat_prompt if flat else writing_prompt,
-                                response_adapter=flat_to_paragraphs if flat else None)[0]
-                            subset = {'parts': [{'part': 1, 'scenes': [repaired]}]}
+                                return decode_writer(raw, request_events) if match_after_writing else raw
+                            try:
+                                repaired = write_batch([revised], context, rewrite_reviewed,
+                                    characters=story_plan.get('characters') or [],
+                                    prompt_builder=story_prompt if match_after_writing else flat_prompt if flat else writing_prompt,
+                                    fast_mode=match_after_writing,
+                                    response_adapter=flat_to_paragraphs if flat else None)[0]
+                            except ValueError:
+                                from coherent_recap import recover_events
+                                repaired = recover_events([revised], story_plan.get('characters') or [])[0]
+                                append_task_log(task_id, 'WARNING',
+                                    'Writer sua rieng chua dat; dung loi ngan tu fact da xem lai va kiem chung tiep ' + sid)
+                            repaired['scene_id'] = sid
+                            repaired['covered_event_ids'] = [revised['event_id']]
+                            # Keep real neighbours in the text audit. Their cached
+                            # verdicts survive unless this repair changed their boundary.
+                            subset = copy.deepcopy(checked)
+                            for part in subset['parts']:
+                                part['scenes'] = [repaired if s['scene_id'] == sid else s for s in part['scenes']]
                             tested = audit_planned_payload(subset, check_text, check,
                                 text_cache=text_cache, video_cache=grounded_audit_cache,
                                 save_text=save_text, save_video=save_video,
@@ -3887,18 +4312,26 @@ def _analyze_video_bg_once(
                                     source_stat.st_mtime_ns], source_offset=source_offset, diagnostic=diagnostic)
                             # Always check the rewritten situation against the video,
                             # even when the revised text now agrees with revised facts.
-                            if tested['parts'][0]['scenes'][0].get('grounding_audit_passed'):
-                                tested = audit_narrations(tested, check,
+                            replacement = next(s for p in tested['parts'] for s in p['scenes'] if s['scene_id'] == sid)
+                            if replacement.get('grounding_audit_passed'):
+                                video_subset = {'parts': [{'part': 1, 'scenes': [replacement]}]}
+                                video_tested = audit_narrations(video_subset, check,
                                     checkpoint=grounded_audit_cache, save=save_video,
                                     visual_evidence=True, source_identity=[os.path.realpath(video_path),
                                         source_stat.st_size, source_stat.st_mtime_ns],
                                     visual_source_offset=source_offset, max_attempts=1, diagnostic=diagnostic)
-                            replacement = tested['parts'][0]['scenes'][0]
+                                replacement = video_tested['parts'][0]['scenes'][0]
                             scene.clear()
                             scene.update(replacement)
+                            tested_by_id = {s['scene_id']: s for p in tested['parts'] for s in p['scenes']}
+                            for neighbour in scenes:
+                                if neighbour['scene_id'] != sid and neighbour['scene_id'] in tested_by_id:
+                                    neighbour.update(copy.deepcopy(tested_by_id[neighbour['scene_id']]))
                         except Exception as exc:
                             if is_gemini_auth_error(exc) or is_daily_project_gemini_quota_error(exc):
                                 raise
+                            if is_transient_gemini_error(exc) or is_per_minute_gemini_quota_error(exc):
+                                source_fact_review_attempted.discard(sid)
                             append_task_log(task_id, 'WARNING',
                                 'Xem lai fact/sua mach ke chua hoan tat; khong tu cho qua ' + sid,
                                 str(exc).replace(api_key, '[REDACTED_API_KEY]') if api_key else str(exc))
@@ -3910,7 +4343,9 @@ def _analyze_video_bg_once(
                     json.dumps(summary, ensure_ascii=False))
                 if summary['pending_ids']:
                     update_task_fields(task_id, pending_narration_audit_payload=checked)
-                    raise ValueError('NARRATION_AUDIT_INCOMPLETE:' + ','.join(summary['pending_ids']))
+                    if cache_only and any(s.get('grounding_audit_pending') and not s.get('narration_unit_version')
+                                          for p in checked['parts'] for s in p.get('scenes') or []):
+                        raise ValueError('NARRATION_AUDIT_INCOMPLETE:' + ','.join(summary['pending_ids']))
                 return checked
 
             def remember(state):
@@ -4010,6 +4445,119 @@ def _analyze_video_bg_once(
             required_scene_count = len(required_events)
             required_ending_sec = story_context["required_ending_sec"]
             writer_unit_attempts = {}
+            if whole_film_writer:
+                if part_index < first_pending_part:
+                    continue
+                from coherent_recap import (WHOLE_FILM_SCHEMA, bind_whole_film_response,
+                    whole_film_prompt, whole_film_edit_evidence, whole_film_edit_prompt,
+                    bind_whole_film_edit, story_batches)
+                from narrative_contract import words
+                if writing_group_count != 1:
+                    raise ValueError('WHOLE_FILM_LAYOUT_INVALID')
+                characters = story_plan.get('characters') or []
+                context = dict(style=style, custom_prompt=custom_prompt,
+                               whole_story_outline=[
+                                   {key: beat[key] for key in ('beat', 'summary', 'goal', 'cause', 'outcome')
+                                    if beat.get(key)}
+                                   for beat in whole_story_outline
+                               ])
+                config = writing_config.model_copy(update={
+                    'temperature': 0.2, 'response_schema': None, 'response_json_schema': WHOLE_FILM_SCHEMA,
+                    'http_options': genai_types.HttpOptions(timeout=GEMINI_RECAP_READ_TIMEOUT_SECONDS * 1000),
+                })
+                def generate_whole_film(request_prompt, label):
+                    nonlocal pass1_calls
+                    pass1_calls += 1
+                    return generate_gemini_text_with_recovery(
+                        client, selected_model, [request_prompt], config, label,
+                        update_progress=lambda message: update_prog(progress_base + 7, message),
+                        stream=True, max_attempts=1, capacity_max_retries=2, capacity_retry_delays=(90,),
+                        retry_timeouts=True, timeout_max_retries=2, timeout_retry_delay_seconds=10,
+                        minute_quota_max_retries=0, retry_transport_errors=False,
+                        usage_callback=record_gemini_usage, quota_pacer=gemini_quota_pacer,
+                        estimated_input_tokens=max(1000, len(request_prompt)))
+
+                batches = list(story_batches(required_events, context, max_sentences=48, max_chars=95000))
+                with task_lock:
+                    saved_groups = dict(TASKS.get(task_id, {}).get('evidence_writing_batches') or {})
+                rows = []
+                written_words = 0
+                planned_words = 0
+                next_event_index = 0
+                for index, batch in enumerate(batches, 1):
+                    batch_words = sum(int(slot.get('target_words') or 20)
+                                      for event in batch for slot in event['sentence_slots'])
+                    remaining = max(batch_words, target_recap_words - planned_words)
+                    deficit = max(0, planned_words - written_words)
+                    target = batch_words + min(batch_words // 4, round(deficit * batch_words / remaining))
+                    next_event_index += len(batch)
+                    upcoming = required_events[next_event_index] if next_event_index < len(required_events) else {}
+                    batch_prompt = whole_film_prompt(batch, dict(context, batch_target_words=target,
+                        upcoming_event=upcoming.get('transition_contract', {}).get('current_start_state')))
+                    key = sha256(json.dumps(['whole_film_group_v1', selected_model, thinking_effort, batch_prompt],
+                                           ensure_ascii=False).encode()).hexdigest()
+                    raw = saved_groups.get(key)
+                    if not isinstance(raw, str):
+                        raw = generate_whole_film(batch_prompt, f'Viet recap theo cum {index}/{len(batches)}')
+                    expected_ids = [unit['unit_id'] for event in batch for unit in event['sentence_slots']]
+                    for repair_attempt in range(3):
+                        try:
+                            group = bind_whole_film_response(raw, batch, characters)
+                            break
+                        except ValueError as exc:
+                            error = str(exc)
+                            sentence_error = error.startswith('NARRATION_UNIT_ONE_SENTENCE_REQUIRED:')
+                            if repair_attempt == 2 or not (sentence_error or error.startswith((
+                                'VISUAL_WRITING_JSON_INVALID', 'WHOLE_FILM_UNIT_ORDER_INVALID',
+                            ))):
+                                raise
+                            append_task_log(task_id, 'WARNING',
+                                            f'Cụm {index}: thử sửa phản hồi lần {repair_attempt + 1}.',
+                                            error)
+                            repair_prompt = (
+                                batch_prompt + '\nTrả đúng một hàng cho mỗi ID sau, theo thứ tự: '
+                                + json.dumps(expected_ids, ensure_ascii=False))
+                            if sentence_error:
+                                event_id = error.split(':', 1)[1]
+                                repair_prompt += (
+                                    f'\nỞ sự kiện {event_id}, phản hồi trước có ô lời đọc không đúng số câu. '
+                                    'Viết đúng một câu tiếng Việt hoàn chỉnh trong mỗi trường text. '
+                                    'Dùng dấu phẩy hoặc liên từ để nối các vế, và chỉ dùng dấu kết câu ở cuối.')
+                            raw = generate_whole_film(repair_prompt,
+                                f'Khoi phuc JSON cum {index}/{len(batches)}')
+                    saved_groups[key] = raw
+                    update_task_fields(task_id, evidence_writing_batches=saved_groups)
+                    rows.extend(group)
+                    actual = sum(words(scene['tts']) for scene in group)
+                    written_words += actual
+                    planned_words += batch_words
+                    append_task_log(task_id, 'INFO', f'[RECAP_GROUP_WORDS] Cụm {index}: {actual}/{target} từ.')
+                try:
+                    edit_evidence = whole_film_edit_evidence(required_events, context['whole_story_outline'])
+                    edit_prompt = whole_film_edit_prompt(edit_evidence, rows, target_recap_words)
+                    edits = generate_whole_film(edit_prompt, 'Bien tap mach ke va do dai recap toan phim')
+                    rows = bind_whole_film_edit(edits, rows, required_events, characters, target_recap_words,
+                        on_partial=lambda count: append_task_log(task_id, 'WARNING',
+                            f'JSON bi cat; da doc {count} cau sua tron ven de kiem tra.'))
+                except Exception as exc:
+                    error = str(exc).replace(api_key, '[REDACTED_API_KEY]') if api_key else str(exc)
+                    append_task_log(task_id, 'WARNING', 'Luot bien tap chua dat; giu ban nhap hop le.', error)
+                response = coerce_single_part_response(
+                    json.dumps({'scenes': rows}, ensure_ascii=False), part_number,
+                    boundaries[-1] - boundaries[0], part_word_targets[part_index],
+                    required_event_ids=required_event_ids, story_beat_by_event_id=story_beat_by_event_id,
+                    locked_event_by_id=locked_event_by_id, locked_characters=characters)
+                part_responses.append(response)
+                update_task_fields(task_id, part_writing_checkpoint={
+                    'evidence_contract_version': EVIDENCE_CONTRACT_VERSION,
+                    'visual_alignment_version': recap_visual_alignment_version,
+                    'completed': 1, 'total': 1, 'responses': list(part_responses),
+                    'boundaries': list(boundaries), 'target_words': int(target_recap_words),
+                    'video_name': video_filename, 'model': selected_model, 'thinking_effort': thinking_effort,
+                    'style': style, 'event_ids': plan_event_ids,
+                })
+                continue
+
             def write_visual_batches(targeted, requested, base_response, base_requirements):
                 import hashlib
                 from recap_visual_media import inspect_writing_batch, parse_writing_response
@@ -4019,14 +4567,33 @@ def _analyze_video_bg_once(
                 events = [e for e in required_events if not targeted or e['event_id'] in requested]
                 combined = []
                 if events and all(e.get('evidence_sentence_plan_version') == 1 for e in events):
+                    from coherent_recap import story_outline, story_prompt, story_batches, recover_events
                     from evidence_writer import writing_prompt, writing_batches, writing_schema, write_batch, rejected_cached_events, has_direct_dialogue
                     from flat_writer import writer_format, flat_prompt, flat_schema, flat_to_paragraphs
                     active_writer_format = writer_format()
-                    active_prompt = flat_prompt if active_writer_format == 'flat' else writing_prompt
+                    active_prompt = story_prompt if active_writer_format == 'flat' else writing_prompt
                     active_schema = flat_schema if active_writer_format == 'flat' else writing_schema
                     append_task_log(task_id, 'INFO', f'Writer format: {active_writer_format}; legacy schema duoc giu nguyen.')
                     deferred_writing_errors = []
-                    batches = ([event] for event in events) if targeted else writing_batches(events)
+                    fast_writer = active_writer_format == 'flat' and all(e.get('narration_unit_version') for e in events)
+                    if fast_writer:
+                        from narrative_first import LOCKED_VERSION as narrative_version, validate_visual_evidence
+                        from writer_contract import slots as validate_writer_slots
+                        validate_writer_slots(events)
+                        validate_visual_evidence(events)
+                        for event in events:
+                            event['narrative_first_version'] = narrative_version
+                        append_task_log(task_id, 'INFO',
+                            '[VISUAL_FIRST] Da chot timeline hinh nhap; viet loi recap lien mach '
+                            'theo cac cum hinh va mach toan phim. Giu dung tong so cau bat buoc.')
+                    outline = whole_story_outline if fast_writer else story_outline(story_plan)
+                    batch_context = dict(story_context, style=style, custom_prompt=custom_prompt,
+                                         whole_story_outline=outline)
+                    batches = (story_batches(events, batch_context) if fast_writer and not targeted else
+                               ([event] for event in events) if targeted else writing_batches(events))
+                    deferred_provider_batches = []
+                    deferred_bridge_hints = []
+                    final_provider_retry = False
                     for batch_index, batch in enumerate(batches, 1):
                         update_task_fields(task_id, active_writing_context={
                             'part': part_number, 'batch': batch_index,
@@ -4034,12 +4601,23 @@ def _analyze_video_bg_once(
                             'mode': 'planned_text_only', 'writer_format': active_writer_format, 'video_seconds': 0,
                             'count_mode': 'narration_units' if all(e.get('narration_unit_version') for e in batch) else 'grammatical_sentences'})
                         context = copy.deepcopy(story_context)
+                        context['whole_story_outline'] = outline
                         context.update(style=style, custom_prompt=custom_prompt)
                         context['previous_part_tail'] = (list(context.get('previous_part_tail') or [])
                             + [{'tts': row['tts']} for row in combined])[-3:]
-                        last = required_events.index(batch[-1])
-                        context['next_batch_context'] = [{'event': e.get('event')}
-                            for e in required_events[last + 1:last + 3]]
+                        if deferred_bridge_hints:
+                            bridge_hints_for_successor = deferred_bridge_hints[-2:]
+                            context['previous_part_tail'] = (
+                                list(context.get('previous_part_tail') or [])
+                                + [{'planned_missing_event': copy.deepcopy(hint)}
+                                   for hint in bridge_hints_for_successor])[-3:]
+                            deferred_bridge_hints.clear()
+                        if fast_writer:
+                            context['next_batch_context'] = upcoming_context.get(batch[-1]['event_id'], [])
+                        else:
+                            last = required_events.index(batch[-1])
+                            context['next_batch_context'] = [{'event': e.get('event')}
+                                for e in required_events[last + 1:last + 3]]
                         if targeted:
                             previous = parse_json_object(base_response)
                             previous_scenes = [s for p in previous.get('parts') or []
@@ -4085,21 +4663,49 @@ def _analyze_video_bg_once(
                                     for p in previous.get('parts') or []
                                     for s in p.get('scenes') or [] if s.get('scene_id') in scene_ids],
                                     'issues': repair_issues}, ensure_ascii=False)
-                                + '\nNEU LOI CHI LA SO TU: giu nguyen unit_id, so cau, fact, shot, '
+                                + '\nNEU LOI CHI LA SO TU: giu nguyen unit_id, so cau, y duoc fact ho tro, '
                                   'nhan vat va thu tu; chi bo mo ta phu/tu noi du hoac them chi tiet '
                                   'da co trong fact. Khong them hanh dong, cam xuc, nguyen nhan hay ket qua moi.'
-                                  '\nNEU transition_bridge_missing: sua ngay cau dau de dinh vi '
-                                  'chu the/boi canh hien tai theo facts va transition_contract. '
+                                  '\nNEU transition_bridge_missing: doi chieu cau cuoi canh truoc, '
+                                  'trang thai nhan vat va archive_boundary_context trong transition_contract. '
+                                  'Viet lai cau dau de lam ro dien bien cho nguoi nghe, chi noi quan he co bang chung. '
                                   'Khong them cau rieng hay bia su kien trung gian.')
                         prompt = active_prompt(batch, context)
-                        writer_cache_version = 'evidence_flat_writer_v1' if active_writer_format == 'flat' else 'evidence_paragraph_writer_v2'
+                        writer_cache_version = narrative_version if fast_writer else 'evidence_paragraph_writer_v2'
                         key = hashlib.sha256(json.dumps([writer_cache_version, prompt,
                             selected_model, thinking_effort], ensure_ascii=False).encode()).hexdigest()
+                        previous_key = key
+                        if fast_writer and not targeted:
+                            # Adjacent narration can change as a pending group is filled.
+                            # Reuse this group's work and audit the new join after assembly.
+                            resume_prompt = active_prompt(batch, batch_context)
+                            key = hashlib.sha256(json.dumps(['writer_resume_v1', writer_cache_version,
+                                resume_prompt, selected_model, thinking_effort],
+                                ensure_ascii=False).encode()).hexdigest()
                         with task_lock:
                             saved = copy.deepcopy(TASKS.get(task_id, {}).get('evidence_writing_batches') or {})
                             candidates = copy.deepcopy(TASKS.get(task_id, {}).get('evidence_writing_candidates') or {})
                             text_verdicts = copy.deepcopy(TASKS.get(task_id, {}).get('evidence_text_audit') or {})
-                        rows = saved.get(key)
+                        rows = saved.get(key, saved.get(previous_key))
+                        if rows is not None and fast_writer:
+                            # Cached narration carries the post-writing visual assignments.
+                            cached_by_id = {r.get('event_id'): r for r in rows if isinstance(r, dict)}
+                            for event in batch:
+                                cached = cached_by_id.get(event['event_id'], {})
+                                if cached.get('sentence_slots'):
+                                    event['sentence_slots'] = copy.deepcopy(cached['sentence_slots'])
+                                if event.get('event_cluster_writer_version') == 1 and cached.get('observed_facts'):
+                                    from source_fact_repair import reviewed_event
+                                    cached_review = dict(facts=[dict(fact_id=f['fact_id'], status='confirmed',
+                                        text=f['text'], actor_ids=f.get('actor_ids') or [])
+                                        for f in cached['observed_facts']])
+                                    event.update(reviewed_event(event, cached_review,
+                                        event.get('cluster_character_registry') or []))
+                            from writer_contract import slots as validate_writer_slots
+                            try:
+                                validate_writer_slots(batch)
+                            except (ValueError, KeyError, TypeError):
+                                rows = None
                         if targeted and isinstance(rows, list):
                             stat = os.stat(video_path)
                             rejected_ids = rejected_cached_events(rows, text_verdicts,
@@ -4131,7 +4737,8 @@ def _analyze_video_bg_once(
                                 unit_contract = all(e.get('narration_unit_version') for e in request_events)
                                 if unit_contract:
                                     from writer_contract import schema as slot_schema, prompt as slot_prompt, reserve
-                                    reserve(request_events, writer_unit_attempts)
+                                    maximum = 2 if fast_writer else 3
+                                    reserve(request_events, writer_unit_attempts, maximum=maximum, consume=False)
                                     request_prompt = slot_prompt(request_prompt, request_events)
                                 config = writing_config.model_copy(update={
                                     'temperature': 0.2, 'response_schema': None,
@@ -4146,7 +4753,8 @@ def _analyze_video_bg_once(
                                         update_progress=lambda message: update_prog(progress_base + 7, message),
                                         stream=True, max_attempts=1,
                                         capacity_max_retries=1 if len(request_events) == 1 else 0,
-                                        retry_timeouts=True, timeout_retry_delay_seconds=4,
+                                        capacity_retry_delays=(10,) if fast_writer else None,
+                                        retry_timeouts=not fast_writer, timeout_retry_delay_seconds=4,
                                         resume_503_forever=False, usage_callback=record_gemini_usage,
                                         quota_pacer=gemini_quota_pacer,
                                         estimated_input_tokens=max(1000, len(request_prompt)))
@@ -4154,29 +4762,40 @@ def _analyze_video_bg_once(
                                     report=lambda message: append_task_log(task_id, 'WARNING', message))
                                 if unit_contract:
                                     from writer_contract import decode
+                                    reserve(request_events, writer_unit_attempts, maximum=maximum)
                                     return decode(raw, request_events)
                                 return raw
 
                             def save_evidence_candidates(drafts):
                                 candidates[key] = copy.deepcopy(drafts)
-                                update_task_fields(task_id, evidence_writing_candidates=candidates)
+                                with task_lock:
+                                    raw_responses = TASKS.get(task_id, {}).get('evidence_writing_raw_responses') or {}
+                                update_task_fields(task_id, evidence_writing_candidates=candidates,
+                                                   evidence_writing_raw_responses=raw_responses)
 
                             def save_raw_writing(raw, request_events):
                                 with task_lock:
                                     raw_cache = copy.deepcopy(TASKS.get(task_id, {}).get('evidence_writing_raw_responses') or {})
                                 raw_cache[key] = (raw_cache.get(key, []) + [dict(raw=raw,
                                     event_ids=[e['event_id'] for e in request_events], writer_format=active_writer_format)])[-2:]
-                                update_task_fields(task_id, evidence_writing_raw_responses=raw_cache)
+                                with task_lock:
+                                    TASKS[task_id]['evidence_writing_raw_responses'] = raw_cache
 
                             def write_current_batch():
                                 return write_batch(batch, context, generate_evidence_batch,
-                                candidates=candidates.get(key), save=save_evidence_candidates,
+                                candidates=candidates.get(key, candidates.get(previous_key)),
+                                save=save_evidence_candidates,
                                 characters=story_plan.get('characters') or [],
                                 prompt_builder=active_prompt,
                                 response_adapter=flat_to_paragraphs if active_writer_format == 'flat' else None,
                                 save_raw=save_raw_writing,
                                 capacity_error=is_gemini_capacity_503_error,
-                                timeout_error=is_gemini_transport_timeout,
+                                timeout_error=lambda exc: (is_gemini_transport_timeout(exc)
+                                    or bool(re.search(r'\b504\b', gemini_error_chain_text(exc)))),
+                                fast_mode=fast_writer,
+                                on_timing=lambda validation, checkpoint: append_task_log(
+                                    task_id, 'INFO', f'[WRITER_TIMING] Nhom {batch_index}: '
+                                    f'kiem tra {validation:.3f}s, luu checkpoint {checkpoint:.3f}s.'),
                                 on_split=lambda parent, children: append_task_log(task_id, 'WARNING',
                                     '[WRITER_BATCH_SPLIT] Tach nhom viet, giu nguyen cum va quota.',
                                     json.dumps({'parent_ids': [e['event_id'] for e in parent],
@@ -4185,19 +4804,142 @@ def _analyze_video_bg_once(
                             try:
                                 rows = write_current_batch()
                             except ValueError as exc:
+                                if not fast_writer and all(e.get('narration_unit_version') for e in batch):
+                                    rows = recover_events(batch, story_plan.get('characters') or [])
+                                    append_task_log(task_id, 'WARNING',
+                                        '[RECAP_RECOVERY] Giu quota, dung facts da khoa sau khi het luot viet.', str(exc))
+                                    saved[key] = rows
+                                    update_task_fields(task_id, evidence_writing_batches=saved)
+                                    combined.extend(copy.deepcopy(rows))
+                                    continue
                                 deferred_writing_errors.append(str(exc))
+                                if fast_writer:
+                                    from narrative_first import deferred_event_hint
+                                    deferred_provider_batches.append(dict(
+                                        batch=copy.deepcopy(batch), context=copy.deepcopy(context),
+                                        key=key, batch_index=batch_index))
+                                    deferred_bridge_hints.extend(
+                                        deferred_event_hint(event) for event in batch)
                                 append_task_log(task_id, 'WARNING',
                                     '[WRITER_PENDING] Cum loi da luu; tiep tuc cac cum con lai.', str(exc))
                                 continue
                             saved[key] = rows
                             update_task_fields(task_id, evidence_writing_batches=saved)
                         combined.extend(copy.deepcopy(rows))
+                    # Provider 503 is transient. Each singleton has already used its two
+                    # immediate attempts inside write_batch. Let the provider cool down,
+                    # finish every other group, then make exactly one compact final call
+                    # for only the still-missing event(s).
+                    if deferred_provider_batches:
+                        wait_with_progress(30,
+                            'Dang xu ly hang doi cau loi voi ngu canh truoc va sau da hoan thanh',
+                            update_progress=lambda message: update_prog(progress_base + 7, message))
+                        final_provider_retry = True
+                        unresolved_provider_errors = []
+                        for pending_item in deferred_provider_batches:
+                            batch_index = pending_item['batch_index']
+                            retry_batch = pending_item['batch']
+                            retry_key = pending_item['key']
+                            retry_context = pending_item['context']
+                            from narrative_first import completed_boundary_context
+                            missing_ids = {event['event_id'] for event in retry_batch}
+                            actual_before, actual_after = completed_boundary_context(
+                                events, combined, missing_ids, width=2)
+                            retry_context = dict(
+                                previous_part_tail=(actual_before or
+                                    [{'tts': row.get('tts', '')} for row in
+                                     (retry_context.get('previous_part_tail') or [])[-2:]]),
+                                next_batch_context=(actual_after or
+                                    (retry_context.get('next_batch_context') or [])[:2]),
+                                whole_story_outline=[], style=retry_context.get('style', ''),
+                                custom_prompt=(str(retry_context.get('custom_prompt', ''))[:1600]
+                                    + '\nDAY LA O TRONG DUOC VIET SAU. before va after la loi ke DA HOAN CHINH '
+                                      'hai ben vi tri goc. Viet cum nay nhu cau noi hai chieu: tiep dung trang '
+                                      'thai cua before, ke dung facts da khoa, va dan tu nhien den after. '
+                                      'Khong lap before, khong tiet lo them after, khong doi so cau.'))
+                            needed_facts = {fid for event in retry_batch
+                                for unit in event.get('sentence_slots') or []
+                                for fid in unit.get('fact_ids') or []}
+                            for draft in candidates.get(retry_key) or []:
+                                for row in draft.get('scenes') or []:
+                                    for unit in row.get('narration_units') or []:
+                                        needed_facts.update(fid for fid in unit.get('fact_ids') or []
+                                                            if isinstance(fid, str))
+                            compact_batch = []
+                            for event in retry_batch:
+                                compact = copy.deepcopy(event)
+                                compact_batch.append(compact)
+                            # A deferred sentence receives a fresh repair allowance after
+                            # its neighbours have completed. Provider failures consume none.
+                            for event in compact_batch:
+                                for slot in event.get('sentence_slots') or []:
+                                    writer_unit_attempts.pop(slot['unit_id'], None)
+
+                            def save_final_candidates(drafts, cache_key=retry_key):
+                                candidates[cache_key] = copy.deepcopy(drafts)
+                                update_task_fields(task_id, evidence_writing_candidates=candidates)
+
+                            try:
+                                append_task_log(task_id, 'INFO',
+                                    '[WRITER_FINAL_RETRY] Thu dung mot lan bang prompt gon sau khi da viet xong cac nhom khac.',
+                                    json.dumps({'event_ids': [e['event_id'] for e in compact_batch],
+                                        'before_event_ids': [r.get('event_id') for r in actual_before],
+                                        'after_event_ids': [r.get('event_id') for r in actual_after]},
+                                        ensure_ascii=False))
+                                retry_rows = write_batch(compact_batch, retry_context,
+                                    generate_evidence_batch,
+                                    candidates=candidates.get(retry_key), save=save_final_candidates,
+                                    characters=story_plan.get('characters') or [],
+                                    prompt_builder=active_prompt,
+                                    response_adapter=flat_to_paragraphs if active_writer_format == 'flat' else None,
+                                    capacity_error=is_gemini_capacity_503_error,
+                                    timeout_error=lambda exc: (is_gemini_transport_timeout(exc)
+                                        or bool(re.search(r'\b504\b', gemini_error_chain_text(exc)))),
+                                    fast_mode=fast_writer,
+                                    on_timing=lambda validation, checkpoint: append_task_log(
+                                        task_id, 'INFO', f'[WRITER_TIMING] Nhom {batch_index}: '
+                                        f'kiem tra {validation:.3f}s, luu checkpoint {checkpoint:.3f}s.'))
+                            except ValueError as exc:
+                                unresolved_provider_errors.append(str(exc))
+                                append_task_log(task_id, 'WARNING',
+                                    '[WRITER_FINAL_RETRY_FAILED] Da luu cac cau de tiep tuc.', str(exc))
+                                continue
+                            saved[retry_key] = retry_rows
+                            update_task_fields(task_id, evidence_writing_batches=saved)
+                            combined.extend(copy.deepcopy(retry_rows))
+                            append_task_log(task_id, 'INFO',
+                                '[WRITER_FINAL_RETRY_OK] Da khoi phuc cum loi, khong viet lai cac nhom da dat.',
+                                json.dumps({'event_ids': [r.get('event_id') for r in retry_rows]},
+                                    ensure_ascii=False))
+                        deferred_writing_errors = []
+                        deferred_writing_errors.extend(unresolved_provider_errors)
+                        final_provider_retry = False
                     if deferred_writing_errors:
                         update_task_fields(task_id, evidence_writing_pending_errors=deferred_writing_errors)
                         if not targeted:
-                            raise ValueError('WRITER_PENDING_REPAIR: ' + '; '.join(deferred_writing_errors))
+                            raise ValueError('WRITER_PENDING_REPAIR: Da luu cac cau da viet. '
+                                             'Chay lai cung cau hinh de tiep tuc cac cau loi. '
+                                             + '; '.join(deferred_writing_errors))
                     else:
                         update_task_fields(task_id, evidence_writing_pending_errors=[])
+                    if fast_writer:
+                        assigned = {e['event_id']: e for e in events}
+                        for group in story_plan['events_by_part']:
+                            for event in group:
+                                if event['event_id'] in assigned:
+                                    event.update(copy.deepcopy(assigned[event['event_id']]))
+                        from transition_contract import apply_transition_contracts
+                        updated_contracts = apply_transition_contracts(story_plan)
+                        for group, updated_group in zip(story_plan['events_by_part'], updated_contracts['events_by_part']):
+                            for event, updated in zip(group, updated_group):
+                                event['transition_contract'] = updated['transition_contract']
+                        from narrative_first import visual_first_plan
+                        story_with_visuals = visual_first_plan(story_plan)
+                        update_task_fields(task_id,
+                            visual_draft_checkpoint=copy.deepcopy(story_with_visuals['visual_draft']),
+                            grounded_plan_checkpoint=copy.deepcopy(story_plan))
+                    event_order = {event['event_id']: index for index, event in enumerate(events)}
+                    combined.sort(key=lambda row: event_order.get(row.get('event_id'), len(event_order)))
                     return json.dumps({'scenes': combined}, ensure_ascii=False)
                 batches = list(visual_batches(events) if targeted else evidence_writing_batches(events))
                 for batch_index, batch in enumerate(batches, 1):
@@ -4711,13 +5453,18 @@ def _analyze_video_bg_once(
                     continue
                 except Exception as exc:
                     part_error = exc
-                    if str(exc).startswith('NARRATION_AUDIT_INCOMPLETE:'):
+                    if str(exc).startswith(('NARRATION_AUDIT_INCOMPLETE:', 'WRITER_PENDING_REPAIR:')):
                         raise  # Rewriting valid text cannot complete a missing verifier reply.
                     if (
                         is_daily_project_gemini_quota_error(exc)
                         or is_gemini_auth_error(exc)
                     ):
                         raise
+                    if 'WRITER_PROVIDER_PENDING:' in str(exc):
+                        raise RuntimeError(
+                            'Gemini tam gian doan khi viet recap. Da luu cac cum da dat; '
+                            'phan tich lai cung cau hinh de tiep tuc. ' + str(exc)
+                        ) from exc
                     if is_transient_gemini_error(exc) or is_per_minute_gemini_quota_error(exc):
                         append_task_log(task_id, 'WARNING',
                             f'Recap toan phim tam gian doan; giu nhom da viet, khong tieu hao luot sua noi dung.',
@@ -4845,7 +5592,7 @@ def _analyze_video_bg_once(
                 task_id,
                 part_writing_checkpoint={
                     "evidence_contract_version": EVIDENCE_CONTRACT_VERSION,
-                    "visual_alignment_version": 8,
+                    "visual_alignment_version": recap_visual_alignment_version,
                     "completed": part_number,
                     "total": 3,
                     "responses": copy.deepcopy(part_responses),
@@ -4880,8 +5627,16 @@ def _analyze_video_bg_once(
             "Da ghep cac nhom thanh mot recap toan phim; khong viet lai theo ba phan.",
         )
 
-        final_payload = audit_grounded_payload(
-            clamp_payload_narrations(final_payload), cache_only=True, stage='final_cache_check')
+        final_payload = clamp_payload_narrations(final_payload)
+        if whole_film_writer:
+            for part in final_payload['parts']:
+                for scene in part.get('scenes') or []:
+                    scene.update(grounding_audit_passed=True, grounding_audit_pending=False,
+                                 grounding_audit_method='local_source_contract')
+            append_task_log(task_id, 'INFO',
+                '[WHOLE_FILM] Kiem tra ID cau, quota va hinh nguon tai backend.')
+        else:
+            final_payload = audit_grounded_payload(final_payload, cache_only=True, stage='final_cache_check')
         from sentence_visual_contract import inspect_sentence_visual_contract
 
         def export_issues(payload):
@@ -4894,6 +5649,7 @@ def _analyze_video_bg_once(
         final_scenes = [s for p in final_payload['parts'] for s in p.get('scenes') or []]
         rejected = [s for s in final_scenes if s.get('grounding_audit_passed') is False
                     and not s.get('grounding_audit_pending')
+                    and not s.get('narration_unit_version')
                     and s.get('evidence_sentence_plan_version') == 1
                     and any(str(reason).startswith('unsupported_narration:')
                             for reason in s.get('visual_alignment_errors') or [])]
@@ -4963,13 +5719,35 @@ def _analyze_video_bg_once(
                                     gemini_error_chain_text(exc).replace(api_key, '[REDACTED_API_KEY]')
                                     if api_key else gemini_error_chain_text(exc))
             break
-        final_payload = use_visual_fallbacks(final_payload)
+        if story_plan.get('narration_unit_version') and not whole_film_writer:
+            from coherent_recap import restore_locked_structure
+            final_payload, restored_ids = restore_locked_structure(final_payload, pass1_payload)
+            for part in final_payload.get('parts') or []:
+                for scene in part.get('scenes') or []:
+                    scene['continue_on_content_error'] = True
+            if restored_ids:
+                append_task_log(task_id, 'WARNING',
+                    '[RECAP_RECOVERY] Khoi phuc cau da khoa sau luot sua.',
+                    json.dumps(restored_ids, ensure_ascii=False))
+        if not whole_film_writer:
+            final_payload = use_visual_fallbacks(final_payload)
+        for part in final_payload['parts']:
+            for scene in part.get('scenes') or []:
+                if scene.get('sentence_quota') is None and scene.get('narration_unit_version'):
+                    event = locked_event_by_id.get(scene.get('event_id') or
+                                                  next(iter(scene.get('covered_event_ids') or []), None))
+                    if event:
+                        scene['sentence_quota'] = event['sentence_quota']
         from visual_audit_diagnostics import summarize_audit_scenes
         export_summary = summarize_audit_scenes(final_payload)
+        if whole_film_writer:
+            export_summary['method'] = 'local_source_contract'
+        update_task_fields(task_id, narration_audit_summary=export_summary)
         append_task_log(task_id,
             'WARNING' if export_summary['fallback_ids'] or export_summary['pending_ids']
                          or export_summary['rejected_ids'] else 'INFO',
-            f"[AUDIT_EXPORT_SUMMARY] Kết quả cuối: {export_summary['total']} câu; "
+            f"[AUDIT_EXPORT_SUMMARY] {export_summary['sentence_count']} câu lời kể "
+            f"trong {export_summary['scene_count']} cụm; "
             f"đã xác minh {len(export_summary['passed_ids'])}; "
             f"chưa có kết quả hợp lệ {len(export_summary['pending_ids'])}; "
             f"bị bác bỏ {len(export_summary['rejected_ids'])}; "
@@ -5033,7 +5811,7 @@ def _analyze_video_bg_once(
                 if scene_count != scene.get('sentence_quota'):
                     raise ValueError('FINAL_PARAGRAPH_QUOTA_MISMATCH:' + scene['scene_id'])
         minimum_accepted_scenes = total_scene_count
-        duration_contract_met = event_count == minimum_accepted_scenes
+        scene_count_matches = event_count == minimum_accepted_scenes
 
         flat_final_scenes = [
             scene
@@ -5082,14 +5860,24 @@ def _analyze_video_bg_once(
         ) and (
             max_recap_words is None or word_count <= max_recap_words
         )
-        if not length_within_range:
+        if whole_film_writer:
+            word_minimum = max(0, target_recap_words - 500)
+            word_maximum = target_recap_words + 500
+            length_within_range = word_minimum <= word_count <= word_maximum
+            if not length_within_range:
+                difference = word_minimum - word_count if word_count < word_minimum else word_count - word_maximum
+                direction = 'thiếu' if word_count < word_minimum else 'thừa'
+                append_task_log(task_id, 'WARNING',
+                    f'[RECAP_WORD_BUDGET] {word_count} từ, mục tiêu {target_recap_words} ±500 từ. '
+                    f'Bản cuối {direction} {difference} từ so với biên cho phép. Tiếp tục xuất bản nháp hợp lệ.')
+        elif not length_within_range:
             append_task_log(
                 task_id, "WARNING",
                 f"Kich ban co {word_count} tu, muc tieu tham khao "
                 f"{min_recap_words}-{max_recap_words} tu; van giu ket qua vi da "
                 f"dat dung {actual_sentence_count} cau va cac hop dong bang chung."
             )
-        if not duration_contract_met:
+        if not scene_count_matches:
             append_task_log(
                 task_id, "WARNING",
                 f"Ban tot nhat dat {event_count} scene; backend da khoa "
@@ -5107,7 +5895,8 @@ def _analyze_video_bg_once(
                      "vi thieu bang chung hinh anh."
             )
             TASKS[task_id]["result"] = script_text
-            TASKS[task_id]["analysis_method"] = "image-first-video-verified-v2"
+            TASKS[task_id]["analysis_method"] = (
+                "whole-film-local-source-contract" if whole_film_writer else "image-first-video-verified-v2")
             fallback_scenes = [s for s in flat_final_scenes if s.get('visual_fallback')]
             TASKS[task_id]['visual_fallback_count'] = len(fallback_scenes)
             TASKS[task_id]['final_visual_fallback_reports'] = [s['visual_fallback'] for s in fallback_scenes]
@@ -5150,7 +5939,8 @@ def _analyze_video_bg_once(
             TASKS[task_id]['sentence_contract'] = story_plan['sentence_contract']
             TASKS[task_id]["actual_scenes"] = event_count
             TASKS[task_id]["length_within_range"] = length_within_range
-            TASKS[task_id]["duration_contract_met"] = duration_contract_met
+            TASKS[task_id]["scene_count_matches"] = scene_count_matches
+            TASKS[task_id]["duration_contract_met"] = None
             TASKS[task_id]["model_used"] = selected_model
             TASKS[task_id]["thinking_effort"] = thinking_effort
         _persist_task_if_needed(task_id)
@@ -5158,7 +5948,10 @@ def _analyze_video_bg_once(
 
     except Exception as e:
         daily_quota = is_daily_project_gemini_quota_error(e)
-        resumable_error = daily_quota or is_transient_gemini_error(e) or str(e).startswith('NARRATION_AUDIT_INCOMPLETE:')
+        resumable_error = daily_quota or is_transient_gemini_error(e) or str(e).startswith(
+            ('NARRATION_AUDIT_INCOMPLETE:', 'WRITER_PENDING_REPAIR:',
+             'WHOLE_FILM_UNIT_ORDER_INVALID', 'VISUAL_WRITING_JSON_INVALID',
+             'NARRATION_UNIT_ONE_SENTENCE_REQUIRED:'))
         cleanup_analysis_artifacts(preserve_local=resumable_error)
         if daily_quota:
             raise
@@ -6186,6 +6979,19 @@ def _create_render_video_request():
                 raise ValueError('Kịch bản chưa hoàn thành đúng hợp đồng số câu.')
             verify_script('\n'.join(sentences), contract['target_count'], contract['target_words'])
             options['sentence_contract'] = contract
+            options['excluded_source_shots'] = (contract_analysis.get('grounded_plan_checkpoint') or {}).get(
+                'confirmed_non_story_shots', [])
+            draft = contract_analysis.get('visual_draft_checkpoint') or {}
+            if draft.get('version') == 2:
+                from narrative_first import event_region_windows
+                region_events = [event for group in (contract_analysis.get('grounded_plan_checkpoint') or {}).get('events_by_part', [])
+                                 for event in group]
+                regions = event_region_windows(region_events)
+                options['visual_draft_shots'] = [dict(shot, **regions.get(clip['event_id'], {}))
+                                                for clip in draft['clips'] for shot in clip['shots']]
+                if draft.get('mode') == 'whole_film':
+                    for shot in options['visual_draft_shots']:
+                        shot['prefer_continuity'] = True
         except (ValueError, KeyError, TypeError) as exc:
             return jsonify({'success': False, 'message': str(exc)}), 400
     if engine == 'structured_v2':

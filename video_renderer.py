@@ -96,6 +96,16 @@ def _quantize_durations_to_frames(durations, fps=30):
     return result
 
 
+def limit_to_story_footage(start, end, limit, excluded_shots):
+    for shot in excluded_shots:
+        blocked_start, blocked_end = float(shot['start_seconds']), float(shot['end_seconds'])
+        if start < blocked_end and end > blocked_start:
+            raise ValueError('Timeline chua canh ngoai cot truyen.')
+        if blocked_start >= end:
+            limit = min(limit, blocked_start)
+    return limit
+
+
 def build_visual_edit_plan(
     durations,
     starts,
@@ -106,6 +116,8 @@ def build_visual_edit_plan(
     scenes=None,
     strict_visual_lock=False,
     extend_to_next_shot=False,
+    visual_draft_shots=None,
+    excluded_source_shots=(),
 ):
     """Build a normal-speed edit list anchored to Gemini action starts.
 
@@ -119,7 +131,19 @@ def build_visual_edit_plan(
     plan = []
     video_duration = max(0.0, float(video_duration))
     min_playback_speed = min(1.0, max(0.50, float(min_playback_speed)))
+    from narrative_first import fit_selected_shots
+    draft_ranges = {}
+    continuity_shots = {}
+    for shot in visual_draft_shots or []:
+        key = (round(shot['start'], 2), round(shot['end'], 2))
+        if shot.get('prefer_continuity'):
+            continuity_shots[key] = shot
+            continue
+        anchors = shot['anchors'] or [(a + b) / 2 for a, b in shot['spans']]
+        draft_ranges.setdefault(key, set()).update(anchors)
 
+    continuity_ranges = {}
+    continuity_regions = {}
     for index, raw_duration in enumerate(durations):
         output_duration = max(0.05, float(raw_duration))
         raw_start = starts[index] if starts and index < len(starts) else None
@@ -143,6 +167,8 @@ def build_visual_edit_plan(
                 if later_start is not None and float(later_start) > range_start:
                     next_locked_start = min(video_duration, float(later_start))
                     break
+            next_locked_start = limit_to_story_footage(
+                range_start, range_end, next_locked_start, excluded_source_shots)
             available_duration = max(0.05, next_locked_start - range_start)
             if strict_visual_lock and not extend_to_next_shot:
                 # Exact visual grounding is more important than filling the
@@ -166,6 +192,39 @@ def build_visual_edit_plan(
         if video_duration and source_start + source_duration > video_duration:
             source_duration = max(0.0, video_duration - source_start)
 
+        draft_anchors = (draft_ranges.get((round(range_start, 2), round(range_end, 2)))
+                         if has_range else None)
+        if has_range and continuity_shots:
+            key = (round(range_start, 2), round(range_end, 2))
+            members = [continuity_shots[key]] if key in continuity_shots else [
+                shot for (left, right), shot in continuity_shots.items()
+                if key[0] <= left and right <= key[1]]
+            if members and len({shot.get('region_id') for shot in members}) == 1:
+                points = sorted({point for shot in members for point in shot['anchors']
+                                 if range_start <= point < range_end})
+                continuity_ranges[index] = (range_start, range_end, members[0].get('region_id'), points)
+                if members[0].get('region_id') and all(
+                        shot.get('region_start') is not None and shot.get('region_end') is not None
+                        for shot in members):
+                    continuity_regions[index] = (
+                        max(float(shot['region_start']) for shot in members),
+                        min(float(shot['region_end']) for shot in members),
+                    )
+                if points and source_duration < original_duration:
+                    draft_anchors = points
+        shot_spans = None
+        if draft_anchors:
+            if index in continuity_ranges and draft_anchors[-1] - draft_anchors[0] < source_duration:
+                start = max(range_start, min(draft_anchors[0], range_end - source_duration,
+                                             draft_anchors[-1] + .15 - source_duration))
+                if start + source_duration <= draft_anchors[-1]:
+                    start = min(draft_anchors[0], range_end - source_duration)
+                shot_spans = [(start, source_duration)]
+            else:
+                shot_spans = fit_selected_shots(range_start, range_end, draft_anchors, output_duration)
+            source_start = shot_spans[0][0]
+            source_duration = sum(length for _, length in shot_spans)
+            visual_window_end = range_end
         playback_speed = 1.0
         source_end = visual_window_end
         shot_count = 1
@@ -175,6 +234,8 @@ def build_visual_edit_plan(
                 if float(scene.get("end", 0.0)) > source_start + 0.01
                 and float(scene.get("start", 0.0)) < source_end - 0.01
             ))
+        if shot_spans:
+            shot_count = len(shot_spans)
         plan.append({
             "index": index,
             "source_start": source_start,
@@ -187,9 +248,156 @@ def build_visual_edit_plan(
             "extended_by": max(0.0, source_duration - original_duration),
             "shot_count": shot_count,
             "visual_window_end": visual_window_end,
+            **({"shot_spans": shot_spans} if shot_spans else {}),
         })
 
+    _join_continuous_beats(plan, continuity_ranges, excluded_source_shots)
+    _fit_event_regions(plan, starts, ends, [shot for shot in visual_draft_shots or []
+                                          if not shot.get('prefer_continuity')], video_duration)
+    _extend_continuity_footage(plan, continuity_regions, video_duration, excluded_source_shots)
+    if excluded_source_shots:
+        for edit in plan:
+            for start, duration in edit.get('shot_spans') or [(edit['source_start'], edit['source_duration'])]:
+                limit_to_story_footage(start, start + duration, video_duration, excluded_source_shots)
     return plan
+
+
+def _extend_continuity_footage(plan, regions, video_duration, excluded_shots):
+    """Use adjacent unused footage in the same event before holding a frame."""
+    def spans(edit):
+        return edit.get('shot_spans') or [(edit['source_start'], edit['source_duration'])]
+
+    for index, (left, right) in regions.items():
+        edit = plan[index]
+        missing = edit['hold_duration']
+        if missing <= .001 or edit['source_duration'] <= .001:
+            continue
+        pieces = list(spans(edit))
+        first, first_length = pieces[0]
+        last, last_length = pieces[-1]
+        end = last + last_length
+        left, right = max(0.0, left), min(video_duration, right)
+        if index:
+            left = max(left, max(start + length for start, length in spans(plan[index - 1])))
+        if index + 1 < len(plan):
+            right = min(right, plan[index + 1]['source_start'])
+        for shot in excluded_shots:
+            start, stop = float(shot['start_seconds']), float(shot['end_seconds'])
+            if stop > end and start < right:
+                right = min(right, start)
+            if start < first and stop > left:
+                left = max(left, stop)
+        after = min(missing, max(0.0, right - end))
+        before = min(missing - after, max(0.0, first - left))
+        if before + after <= .001:
+            continue
+        pieces[-1] = (last, last_length + after)
+        pieces[0] = (first - before, pieces[0][1] + before)
+        duration = edit['source_duration'] + before + after
+        edit.update(source_start=first - before, source_duration=duration,
+                    visual_window_end=end + after, shot_spans=pieces,
+                    hold_duration=max(0.0, missing - before - after),
+                    extended_by=max(0.0, duration - edit['original_source_duration']))
+
+
+def _join_continuous_beats(plan, ranges, excluded_shots):
+    """Keep adjacent beats in one situation continuous when every anchor fits."""
+    joined = set()
+    for first, (start, end, region, points) in ranges.items():
+        if first in joined or not region:
+            continue
+        run = [first]
+        duration = plan[first]['output_duration']
+        lower = max(start, points[-1] + .001 - duration) if points else start
+        upper = points[0] if points else end
+        has_anchor = bool(points)
+        while first + len(run) in ranges:
+            index = first + len(run)
+            next_start, next_end, next_region, next_points = ranges[index]
+            if next_region != region or abs(next_start - end) > .011:
+                break
+            next_duration = duration + plan[index]['output_duration']
+            next_lower = max(lower, next_points[-1] + .001 - next_duration) if next_points else lower
+            next_upper = min(upper, next_points[0] - duration) if next_points else upper
+            if next_lower > min(next_upper, next_end - next_duration):
+                break
+            run.append(index)
+            has_anchor |= bool(next_points)
+            lower, upper, duration, end = next_lower, next_upper, next_duration, next_end
+        if len(run) < 2 or not has_anchor or any(start < shot['end_seconds'] and end > shot['start_seconds']
+                               for shot in excluded_shots):
+            continue
+        joined.update(run)
+        cursor = lower
+        for index in run:
+            edit = plan[index]
+            length = edit['output_duration']
+            edit.update(source_start=cursor, source_duration=length, visual_window_end=cursor + length,
+                        shot_spans=[(cursor, length)], shot_count=1, hold_duration=0.0,
+                        extended_by=max(0.0, length - edit['original_source_duration']))
+            cursor += length
+
+
+def _fit_event_regions(plan, starts, ends, draft_shots, video_duration):
+    """Reallocate a whole event after TTS when a selected shot runs short."""
+    regions = {}
+    for shot in draft_shots or []:
+        if shot.get('region_id'):
+            key = (round(shot['start'], 2), round(shot['end'], 2))
+            regions[key] = shot
+    groups = {}
+    for index, edit in enumerate(plan):
+        if not edit['has_range']:
+            continue
+        shot = regions.get((round(float(starts[index]), 2), round(float(ends[index]), 2)))
+        if shot is None:
+            members = [item for item in regions.values()
+                       if float(starts[index]) <= item['start'] + .01
+                       and item['end'] <= float(ends[index]) + .01]
+            if members and len({item['region_id'] for item in members}) == 1:
+                shot = dict(members[0], anchors=sorted({point for item in members
+                                                       for point in item.get('anchors') or []}))
+        if shot:
+            groups.setdefault(shot['region_id'], []).append((index, shot))
+    for region_id, rows in groups.items():
+        if not any(plan[index]['hold_duration'] > .001 for index, _ in rows):
+            continue
+        left = max(0.0, max(float(shot['region_start']) for _, shot in rows))
+        right = min(video_duration, min(float(shot['region_end']) for _, shot in rows))
+        first, last = rows[0][0], rows[-1][0]
+        if first:
+            previous = plan[first - 1]
+            left = max(left, max(a + b for a, b in previous.get('shot_spans') or
+                                 [(previous['source_start'], previous['source_duration'])]))
+        if last + 1 < len(plan):
+            right = min(right, plan[last + 1]['source_start'])
+        latest, boundary = {}, right
+        for index, shot in reversed(rows):
+            duration = plan[index]['output_duration']
+            anchors = shot.get('anchors') or []
+            deadline = min(anchors) if anchors else float(ends[index]) - .001
+            start = min(boundary - duration, deadline)
+            earliest = max(anchors) - duration + .001 if anchors else float(starts[index]) - duration + .001
+            if start < max(left, earliest) - .001:
+                raise ValueError(f'EVENT_REGION_FOOTAGE_SHORTAGE: {region_id}, canh {index + 1}; '
+                                 'can rut loi hoac phan bo lai trong vung truoc khi xuat.')
+            latest[index] = start
+            boundary = start
+        cursor = left
+        for index, shot in rows:
+            edit = plan[index]
+            anchors = shot.get('anchors') or []
+            earliest = max(anchors) - edit['output_duration'] + .001 if anchors else float(starts[index]) - edit['output_duration'] + .001
+            start = max(cursor, earliest, min(float(starts[index]), latest[index]))
+            if start > latest[index] + .001:
+                raise ValueError(f'EVENT_REGION_FOOTAGE_SHORTAGE: {region_id}')
+            cursor = start + edit['output_duration']
+            edit.update(source_start=start, source_duration=edit['output_duration'],
+                        visual_window_end=cursor, hold_duration=0.0,
+                        shot_spans=[(start, edit['output_duration'])], shot_count=1,
+                        extended_by=max(0.0, edit['output_duration'] - edit['original_source_duration']))
+    if regions and any(edit['hold_duration'] > .001 for edit in plan):
+        raise ValueError('EVENT_REGION_FOOTAGE_SHORTAGE: can phan bo lai loi trong vung truoc khi xuat.')
 
 
 def build_shot_spans(edit, scenes, min_shot_seconds=1.5, max_shot_seconds=3.0,
@@ -587,9 +795,12 @@ def _step2_cut_segments(input_video_path, temp_dir, sentences, durations, D_vide
             scenes=scenes,
             strict_visual_lock=True,
             extend_to_next_shot=True,
+            visual_draft_shots=options.get('visual_draft_shots'),
+            excluded_source_shots=options.get('excluded_source_shots') or (),
         )
         for edit in ranged_plan:
-            edit["shot_spans"] = build_shot_spans(edit, scenes, preserve_action_order=True)
+            if not edit.get('shot_spans'):
+                edit["shot_spans"] = build_shot_spans(edit, scenes, preserve_action_order=True)
         extended = []
         capped = []
         for index, edit in enumerate(ranged_plan):
@@ -905,6 +1116,8 @@ def create_master_video_raw(input_video_path, output_path, sentences, durations,
     audit_plan = build_visual_edit_plan(
         _quantize_durations_to_frames(durations), timestamps, end_timestamps,
         D_video, strict_visual_lock=True, extend_to_next_shot=True,
+        visual_draft_shots=options.get('visual_draft_shots'),
+        excluded_source_shots=options.get('excluded_source_shots') or (),
     ) if complete_locked_timeline else []
     output_cursor = 0.0
     for edit, text in zip(audit_plan, sentences):
@@ -1022,6 +1235,14 @@ def fit_tts_to_time_ranges(audio_paths, durations, starts, ends, temp_dir, max_s
             pass
     return fitted_paths, fitted_durations, adjusted
 
+def _render_tts_options(options, update_status_fn):
+    def report_progress(done, total):
+        update_status_fn(10 + 19 * done // total,
+                         f'Đang tạo giọng đọc · {done}/{total} cụm đã xong')
+
+    return dict(options or {}, _tts_progress=report_progress)
+
+
 def export_capcut_package(task_id, input_video_path, bgm_path, bgm_volume, voice_name, voice_rate, sentences, options, update_status_fn, diagnostic_log=None):
     temp_dir = os.path.join(os.path.dirname(input_video_path), f"temp_{task_id}")
     os.makedirs(temp_dir, exist_ok=True)
@@ -1032,7 +1253,8 @@ def export_capcut_package(task_id, input_video_path, bgm_path, bgm_volume, voice
         # 1. TTS (SubMaker: giong doc lien mach + timing chinh xac)
         update_status_fn(10, "Đang tổng hợp giọng nói AI (TTS SubMaker)...")
         audio_paths, durations, word_cues = generate_all_tts(
-            clean_sentences, voice_name, voice_rate, temp_dir, options, diagnostic_log,
+            clean_sentences, voice_name, voice_rate, temp_dir,
+            _render_tts_options(options, update_status_fn), diagnostic_log,
             return_word_cues=True,
         )
         visual_groups = [
@@ -1106,7 +1328,8 @@ def render_review_video_ffmpeg(task_id, input_video_path, bgm_path, bgm_volume, 
         update_status_fn(10, "Đang tổng hợp giọng nói AI (TTS SubMaker)...")
         tts_started = time.monotonic()
         audio_paths, durations, word_cues = generate_all_tts(
-            clean_sentences, voice_name, voice_rate, temp_dir, options, diagnostic_log,
+            clean_sentences, voice_name, voice_rate, temp_dir,
+            _render_tts_options(options, update_status_fn), diagnostic_log,
             return_word_cues=True,
         )
         if diagnostic_log:

@@ -615,6 +615,15 @@ class ThreePartRecapTests(unittest.TestCase):
             narration_candidate_rank(close_but_repeated, 2),
         )
 
+    def test_candidate_rank_keeps_repair_with_fewer_rejected_scenes(self):
+        original = dict(invalid_timestamp_scenes=[dict(scene_id=f'S{i}',
+            reasons=['unsupported_narration:inference']) for i in range(27)])
+        repaired = dict(invalid_timestamp_scenes=[dict(scene_id=f'S{i}',
+            reasons=['unsupported_narration:transition_bridge_missing']) for i in range(5)],
+            invalid_character_mentions=[dict(scene_id='S3'), dict(scene_id='S4')])
+        self.assertLess(narration_candidate_rank(repaired, 1),
+                        narration_candidate_rank(original, 1))
+
     def test_targeted_repair_requests_only_bad_and_missing_events(self):
         payload = {
             "parts": [{"part": 1, "scenes": [

@@ -22,12 +22,20 @@ def slots(events):
 
 
 def schema(events):
+    if events and all(e.get('event_cluster_writer_version') == 1 for e in events):
+        from event_cluster_writer import schema as event_schema
+        return event_schema(events)
+    if events and all(e.get('narrative_first_version') for e in events):
+        from narrative_first import schema as narrative_schema
+        return narrative_schema(events)
     keys = slots(events)
     return {'type': 'object', 'properties': {key: {'type': 'string'} for key in keys},
             'required': list(keys), 'additionalProperties': False}
 
 
 def prompt(original, events):
+    if events and all(e.get('narrative_first_version') for e in events):
+        return original
     return (original + '\nOUTPUT CONTRACT OVERRIDE: Return only a JSON object mapping '
         'each required unit_id key to its one complete narration sentence. '
         'Do not return sentences arrays or event_id fields. All keys are mandatory; '
@@ -36,22 +44,39 @@ def prompt(original, events):
 
 
 def decode(raw, events):
+    if events and all(e.get('event_cluster_writer_version') == 1 for e in events):
+        from event_cluster_writer import decode as event_decode
+        return event_decode(raw, events)
     from recap_visual_media import parse_writing_response
     value = parse_writing_response(raw)
+    if events and all(e.get('narrative_first_version') for e in events):
+        from narrative_first import MATCH_AFTER_WRITING_VERSION, bind_response
+        return bind_response(value, events, defer_visuals=all(
+            e.get('narrative_first_version') == MATCH_AFTER_WRITING_VERSION for e in events))
     expected = slots(events)
-    if not isinstance(value, dict) or set(value) != set(expected):
+    if not isinstance(value, dict):
         raise ValueError('NARRATION_UNIT_KEYS_INVALID')
-    if any(not isinstance(value[key], str) or not value[key].strip() for key in expected):
-        raise ValueError('NARRATION_UNIT_TEXT_EMPTY')
+    from coherent_recap import one_sentence
+    for event in events:
+        facts = {f['fact_id']: f for f in event['observed_facts']}
+        for unit in event['sentence_slots']:
+            uid = unit['unit_id']
+            text = value.get(uid)
+            if not isinstance(text, str) or not text.strip():
+                text = ' '.join(facts[fid].get('text', '') for fid in unit['fact_ids'])
+                if not text.strip():
+                    raise ValueError('NARRATION_UNIT_TEXT_EMPTY')
+            value[uid] = one_sentence(text)
     return json.dumps({'sentences': [dict(event_id=eid, unit_id=uid, text=value[uid])
         for uid, eid in expected.items()]}, ensure_ascii=False)
 
 
-def reserve(events, counts, maximum=3):
-    """Count all draft/repair layers against the same unit allowance."""
+def reserve(events, counts, maximum=3, consume=True):
+    """Check the unit allowance and count only completed provider responses."""
     keys = list(slots(events))
     exhausted = [key for key in keys if counts.get(key, 0) >= maximum]
     if exhausted:
         raise ValueError('WRITER_REPAIR_BUDGET_EXHAUSTED:' + ','.join(exhausted))
-    for key in keys:
-        counts[key] = counts.get(key, 0) + 1
+    if consume:
+        for key in keys:
+            counts[key] = counts.get(key, 0) + 1

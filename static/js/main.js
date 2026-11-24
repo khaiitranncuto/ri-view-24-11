@@ -16,7 +16,7 @@ const state = {
     script: '',
     sentences: [],
     voiceName: 'vi-VN-HoaiMyNeural',
-    voiceRate: '+20%',
+    voiceRate: '+0%',
     narrationBudget: null,
     projectId: '',
     scriptProjectId: '',
@@ -64,7 +64,7 @@ let apiVerificationController = null;
 let apiVerificationRevision = 0;
 
 function narrationSentencesPerMinute() {
-    const rate = Number(dom.voiceRateSlider?.value ?? 20);
+    const rate = Number(dom.voiceRateSlider?.value ?? 0);
     return 13.5 * (1 + rate / 100) / 1.2;
 }
 
@@ -72,7 +72,8 @@ function displayActualNarrationTiming(taskData) {
     const timing = taskData?.narration_timing;
     const element = document.getElementById('stat-est-duration');
     if (element && Number.isFinite(timing?.actual_minutes)) {
-        element.textContent = `${timing.actual_minutes.toFixed(1)}p (TTS thực tế)`;
+        const target = Number.isFinite(timing.target_minutes) ? ` / mục tiêu ${timing.target_minutes}p` : '';
+        element.textContent = `${timing.actual_minutes.toFixed(1)}p TTS thực tế${target}`;
     }
 }
 
@@ -942,7 +943,7 @@ function updateReviewMinutesHint() {
     const baseline = sourceMinutes * 0.2;
     const ratio = selectedMinutes / Math.max(0.1, baseline);
     const mode = ratio < 0.8 ? 'cô đọng' : (ratio <= 1.2 ? 'cân bằng' : 'mở rộng');
-    const rate = Number(dom.voiceRateSlider?.value ?? 20);
+    const rate = Number(dom.voiceRateSlider?.value ?? 0);
     const sentenceCount = Math.max(3, Math.round(Math.min(selectedMinutes, sourceMinutes) * narrationSentencesPerMinute()));
     dom.reviewMinutesHint.textContent = `Video gốc ${sourceMinutes} phút; chế độ ${mode}. Khóa ${sentenceCount} câu ở ${rate >= 0 ? '+' : ''}${rate}%. Số phút là ước tính, đối chiếu sau khi tạo giọng.`;
 }
@@ -1263,7 +1264,7 @@ async function generateScript(options = {}) {
                 style: style,
                 custom_prompt: customPromptText,
                 review_minutes: reviewMinutesValue,
-                voice_rate: `${Number(dom.voiceRateSlider?.value ?? 20) >= 0 ? '+' : ''}${dom.voiceRateSlider?.value ?? 20}%`,
+                voice_rate: `${Number(dom.voiceRateSlider?.value ?? 0) >= 0 ? '+' : ''}${dom.voiceRateSlider?.value ?? 0}%`,
                 subtitle_text: subtitleText,
                 enable_multi_voice: document.getElementById('enable-multi-voice') ? document.getElementById('enable-multi-voice').checked : false
             })
@@ -1302,7 +1303,21 @@ async function generateScript(options = {}) {
                 } else {
                     const sentenceCount = taskData.actual_sentences;
                     const sentenceTarget = taskData.target_sentence_count;
-                    showToast(sentenceCount != null && sentenceTarget != null
+                    const audit = taskData.narration_audit_summary;
+                    if (audit) {
+                        const reviewCount = new Set([
+                            ...audit.fallback_ids, ...audit.pending_ids, ...audit.rejected_ids
+                        ]).size;
+                        const checkLabel = audit.method === 'local_source_contract'
+                            ? 'cụm đã kiểm tra liên kết hình nguồn' : 'cụm đã xác minh';
+                        const lengthWarning = taskData.length_within_range === false;
+                        showToast(
+                            `Đã viết ${audit.sentence_count} câu trong ${audit.scene_count} cụm. `
+                            + `${audit.passed_ids.length} ${checkLabel}, ${reviewCount} cụm cần xem lại.`
+                            + (lengthWarning ? ' Số từ ngoài mức dự kiến. Thời lượng sẽ được đo khi tạo giọng.' : ''),
+                            reviewCount || lengthWarning ? 'warning' : 'success'
+                        );
+                    } else showToast(sentenceCount != null && sentenceTarget != null
                         ? `Hoàn tất: ${sentenceCount}/${sentenceTarget} câu, ${taskData.actual_words} từ.`
                         : 'AI viết kịch bản hoàn tất!', 'success');
                 }

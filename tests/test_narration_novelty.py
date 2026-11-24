@@ -155,6 +155,26 @@ class NarrationNoveltyTests(unittest.TestCase):
         self.assertEqual(state['event_id'], 'E1')
         self.assertEqual(state['activity_state'], 'Đã bắt cá xong.')
 
+    def test_semantic_review_only_sends_facts_with_eligible_pairs(self):
+        import json
+        from unittest.mock import Mock
+
+        events = [self.event('E1', ['The group is trapped.']),
+                  self.event('E2', ['They cannot get out.'], 1),
+                  self.event('E3', ['Someone closes the door.'], 2),
+                  self.event('E4', ['The group is trapped again.'], 90)]
+        events[2]['observed_facts'][0]['canonical_actor_ids'] = ['P2']
+        generate = Mock(return_value={'duplicates': []})
+        review_plan_novelty(self.plan(events), generate)
+        generate.assert_called_once()
+        request = json.loads(generate.call_args.args[0].split('\n', 1)[1])
+        self.assertEqual(request['target_ids'], ['E2F0'])
+        self.assertEqual([fact['fact_id'] for fact in request['facts']], ['E1F0', 'E2F0'])
+
+        generate.reset_mock()
+        review_plan_novelty(self.plan([events[0], events[2], events[3]]), generate)
+        generate.assert_not_called()
+
     def test_actual_app_review_reuses_content_checkpoint(self):
         import ast
         import json
@@ -165,15 +185,21 @@ class NarrationNoveltyTests(unittest.TestCase):
         tree = ast.parse((Path(__file__).resolve().parents[1] / 'app.py').read_text(encoding='utf8'))
         node = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
                     and n.name == 'review_narration_facts')
-        factory = ast.parse('def factory():\n    pass1_calls = 0\n').body[0]
+        factory = ast.parse(
+            'def factory():\n    pass1_calls = 0\n    novelty_review_unavailable = False\n'
+            '    novelty_attempted_ollama = novelty_used_ollama = ollama_unavailable = False\n'
+        ).body[0]
         factory.body.extend([node, ast.Return(ast.Name(id=node.name, ctx=ast.Load()))])
         task = {}
         generate = Mock(return_value='{"duplicates": []}')
         env = dict(json=json, copy=copy, task_lock=threading.Lock(), TASKS={'offline': task},
             task_id='offline', selected_model='test', client=None,
-            writing_config=SimpleNamespace(model_copy=lambda update: update),
+            writing_config=SimpleNamespace(model_copy=lambda update: SimpleNamespace(**update)),
+            review_duplicates_with_ollama=Mock(return_value={'duplicates': []}),
             generate_gemini_text_with_recovery=generate, record_gemini_usage=None,
-            gemini_quota_pacer=None, update_task_fields=lambda task_id, **fields: task.update(fields))
+            gemini_quota_pacer=None, update_task_fields=lambda task_id, **fields: task.update(fields),
+            is_gemini_capacity_503_error=lambda exc: '503 UNAVAILABLE' in str(exc),
+            append_task_log=Mock())
         exec(compile(ast.fix_missing_locations(ast.Module(body=[factory], type_ignores=[])),
                      '<novelty review>', 'exec'), env)
         review = env['factory']()
@@ -182,6 +208,39 @@ class NarrationNoveltyTests(unittest.TestCase):
         self.assertEqual(generate.call_count, 1)
         review('facts version 2')
         self.assertEqual(generate.call_count, 2)
+        self.assertEqual(generate.call_args.args[3].max_output_tokens, 8192)
+        self.assertEqual(generate.call_args.kwargs['capacity_max_retries'], 1)
+        self.assertTrue(generate.call_args.kwargs['retry_timeouts'])
+
+        generate.side_effect = RuntimeError('503 UNAVAILABLE')
+        self.assertEqual(review('uncached batch'), {'duplicates': []})
+        self.assertEqual(review('next batch'), {'duplicates': []})
+        review('facts version 1')
+        self.assertEqual(generate.call_count, 3)
+        env['append_task_log'].assert_called_once()
+
+        review = env['factory']()
+        self.assertEqual(review('local batch', duplicate_only=True),
+                         {'duplicates': [], '_ollama_review': True})
+        self.assertEqual(generate.call_args.kwargs['capacity_max_retries'], 0)
+        env['review_duplicates_with_ollama'].assert_called_once()
+        self.assertNotIn('omit_fact_ids',
+                         env['review_duplicates_with_ollama'].call_args.args[1]['properties'])
+        generate.side_effect = None
+        self.assertEqual(review('next duplicate batch', duplicate_only=True), {'duplicates': []})
+        env['review_duplicates_with_ollama'].assert_called_once()
+        env['review_duplicates_with_ollama'].side_effect = OSError('offline')
+        generate.side_effect = RuntimeError('503 UNAVAILABLE')
+        self.assertEqual(review('offline duplicate batch', duplicate_only=True), {'duplicates': []})
+        self.assertEqual(review('another duplicate batch', duplicate_only=True), {'duplicates': []})
+        self.assertEqual(env['review_duplicates_with_ollama'].call_count, 2)
+
+        generate.side_effect = RuntimeError('401 UNAUTHENTICATED')
+        with self.assertRaisesRegex(RuntimeError, '401'):
+            env['factory']()('uncached batch')
+        generate.side_effect = None
+        env['factory']()('uncached batch')
+        self.assertEqual(generate.call_count, 9)
 
 
 if __name__ == '__main__':

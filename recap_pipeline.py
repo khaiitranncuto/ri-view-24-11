@@ -887,6 +887,9 @@ MỤC TIÊU PHÂN CẢNH:
 - Các chương phải phủ từ mở đầu thật tới kết thúc thật. Mỗi chương thường dài 8-15 phút; không gom cả phim
   thành vài beat rời rạc và không bỏ khoảng thời gian dài chỉ vì ít hành động.
 - Mỗi chương ghi trạng thái đầu, mục tiêu/xung đột, thay đổi chính và trạng thái cuối để lượt clip sau tìm event ID.
+- Trong summary, kể rõ quan hệ giữa các diễn biến theo bằng chứng hình và lời thoại. Làm rõ vì sao nhân vật
+  quyết định hành động, trở ngại làm kế hoạch thay đổi và kết quả dẫn sang chương sau. Với video tài liệu,
+  ghi câu hỏi đang được giải đáp, bằng chứng và phát hiện. Chỗ quan hệ chưa rõ thì ghi chưa rõ.
 - Giữ đủ mở đầu cần thiết, biến cố khởi phát, mục tiêu, xung đột, bước ngoặt, cao trào,
   hậu quả, giải quyết và kết thúc thật để người chưa xem vẫn hiểu câu chuyện.
 - Không được bỏ một thông tin ngắn nếu nó làm thay đổi hoàn cảnh, mục tiêu, nguy hiểm hoặc kết quả,
@@ -928,7 +931,7 @@ NHÂN VẬT:
   không chép tên chưa xác nhận vào mạch truyện; backend sẽ hiển thị bằng sổ nhân vật.
   Ghi face_features, body_features, distinctive_features khi thấy rõ, không bịa để đủ trường.
   neutral_alias luôn là mô tả ngắn phân biệt người đó (ví dụ "cậu bé đeo kính"), không lặp lại tên riêng.
-- Ghi non_story_ranges chính xác cho logo, opening, credits, ending montage/outro. Những cảnh bay lượn
+- Ghi non_story_ranges cho logo, nhạc/montage giới thiệu, quảng cáo chen giữa, trailer, credits và outro. Những cảnh bay lượn
   trong nhạc kết/credits không phải chuyến phiêu lưu mới. Chỉ đánh dấu khi thấy bằng chứng trong video,
   không cắt tùy tiện theo phần trăm thời lượng; cảnh mở đầu có diễn biến thật vẫn thuộc cốt truyện.
 
@@ -946,7 +949,7 @@ LỜI THOẠI WHISPER TOÀN PHIM (có thể rỗng khi phải fallback sang audi
 
 Chỉ trả JSON hợp lệ:
 {{"story_contract":{{"premise":"","protagonist_goal":"","central_conflict":"","ending_meaning":""}},
-"non_story_ranges":[{{"start_seconds":0,"end_seconds":1,"kind":"logo|opening|credits|outro|ending_montage","confidence":0.0}}],
+"non_story_ranges":[{{"start_seconds":0,"end_seconds":1,"kind":"logo|opening|credits|outro|ending_montage|advertisement|trailer|promo","confidence":0.0}}],
 "characters":[{{"id":"P01","name":"","aliases":[],"neutral_alias":"","visual_signature":"",
 "stable_features":[],"face_features":[],"body_features":[],"distinctive_features":[],"appearance_variants":[],"reference_seconds":[],"name_evidence":{{"kind":"unknown","quote":"","start_seconds":0,"end_seconds":0,"shot_ids":[],"association":"uncertain"}},"role":"","confidence":0.0}}],
 "story_beats":[{{"beat_id":"GB001","start_seconds":0,"end_seconds":10,
@@ -5607,6 +5610,9 @@ def build_part_story_context(story_plan, part_number, previous_response=None):
     local_events = []
     for event in story_plan["events_by_part"][index]:
         local_event = copy.deepcopy(event)
+        if event.get('event_cluster_writer_version'):
+            local_event['source_region_start_seconds'] = float(event['start_seconds'])
+            local_event['source_region_end_seconds'] = float(event['end_seconds'])
         local_event["start"] = _format_time(float(event["start_seconds"]) - offset)
         local_event["end"] = _format_time(float(event["end_seconds"]) - offset)
         if event.get('visual_selection_pending'):
@@ -6914,7 +6920,7 @@ def single_part_has_hard_failures(requirements):
 
 
 def merge_single_part_responses(responses, boundaries, target_words, *, single_timeline=False):
-    """Merge three clip-local Gemini responses into one global payload."""
+    """Merge clip-local responses or preserve one full-film timeline."""
     if single_timeline:
         if len(responses) != 1 or len(boundaries) != 2:
             raise ValueError('GLOBAL_WRITING_LAYOUT_INVALID')
@@ -7006,6 +7012,11 @@ def merge_single_part_responses(responses, boundaries, target_words, *, single_t
         # legacy timestamp collision repair or strip their observation proofs.
         return {'characters': merged_characters, 'parts': merged_parts,
                 'visual_selection_mode': 'grounded_evidence_first'}
+
+    if single_timeline:
+        # A local visual fallback can coexist with locked scenes. Keep their
+        # sentence IDs and evidence intact through the full-film export audit.
+        return {"characters": merged_characters, "parts": merged_parts}
 
     # Timestamp is the source of truth at the final join. Events from Gemini
     # and Whisper can legitimately share one source timestamp, so first order
@@ -7585,7 +7596,11 @@ def payload_to_timeline(payload):
                 raise ValueError('SENTENCE_SHOTS_PENDING: ' + str(scene.get('scene_id', '')))
             if scene.get("visual_alignment_version") == 1:
                 links = scene.get("visual_links") or []
-                if (scene.get("visual_alignment_errors")
+                alignment_errors = scene.get("visual_alignment_errors") or []
+                if scene.get('visual_fallback') and scene.get('narration_unit_version'):
+                    alignment_errors = [error for error in alignment_errors
+                                        if not str(error).startswith(('narration_audit_pending:', 'unsupported_narration:'))]
+                if (alignment_errors
                         or len(scene.get("visual_beats") or []) != max(0, len(links) - 1)):
                     raise ValueError(
                         f"VISUAL_ALIGNMENT_MISSING: {scene.get('scene_id', '')}; "
@@ -7732,8 +7747,14 @@ def inspect_narration_quality(payload, maximum=40):
 def narration_candidate_rank(requirements, repeated_issue_count):
     """Rank writer candidates: hard safety, repetition, then soft distance."""
     result = requirements if isinstance(requirements, dict) else {}
+    rejected_scenes = {
+        str(row.get('scene_id') or row.get('index') or (kind, index))
+        for kind in ('invalid_character_mentions', 'invalid_timestamp_scenes', 'invalid_tts_scenes')
+        for index, row in enumerate(result.get(kind) or [])
+    }
     return (
         1 if single_part_has_hard_failures(result) else 0,
+        len(rejected_scenes),
         len(result.get("invalid_character_mentions") or []),
         sum(any(str(reason).startswith('unsupported_narration:')
                 for reason in row.get('reasons') or [])

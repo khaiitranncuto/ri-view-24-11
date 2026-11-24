@@ -45,6 +45,21 @@ def payload(events):
 
 
 class EvidenceWriterTests(unittest.TestCase):
+    def test_event_region_verifier_uses_video_and_reuses_sentence_cache(self):
+        data = payload([event(1), event(2)])
+        cache = {}
+        calls = []
+        def check_video(cards):
+            calls.append([c['scene_id'] for c in cards])
+            return {'checks': [{'scene_id': c['scene_id'], 'faithful': True,
+                                'reason': ''} for c in cards]}
+        options = dict(event_region_mode=True, video_cache=cache,
+                       save_video=lambda value: cache.update(value), source_identity='film')
+        checked = audit_planned_payload(data, Mock(side_effect=AssertionError('text pass')),
+                                        check_video, **options)
+        audit_planned_payload(checked, Mock(), check_video, **options)
+        self.assertEqual(calls, [['S0001', 'S0002']])
+
     def test_targeted_repair_keeps_other_event_and_relocks_the_same_sentence_plan(self):
         events = [event(1), event(2)]
         original = payload(events)
@@ -87,6 +102,7 @@ class EvidenceWriterTests(unittest.TestCase):
                 task_id='offline', TASKS={'offline': state}, grounded_audit_cache={},
                 video_path=str(video), writing_config=types.GenerateContentConfig(), client=object(),
                 selected_model='offline-model', progress_base=42, update_prog=lambda *a: None,
+                required_events=[event()],
                 generate_gemini_text_with_recovery=generate, record_gemini_usage=lambda *a: None,
                 gemini_quota_pacer=None, append_task_log=lambda *a: None,
                 update_task_fields=lambda task_id, **fields: state.update(fields))

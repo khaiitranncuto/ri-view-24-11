@@ -10,6 +10,7 @@ import json
 
 
 VERSION = 3
+AUDIT_VERSION = 4
 
 
 def narration_boundary(previous):
@@ -21,7 +22,7 @@ def narration_boundary(previous):
 
 
 def boundary_audit_signature(signature, boundary):
-    return hashlib.sha256(json.dumps([VERSION, signature, boundary],
+    return hashlib.sha256(json.dumps([AUDIT_VERSION, signature, boundary],
         ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 _EXPLICIT = {
     'continuation': 'continuation',
@@ -55,13 +56,13 @@ def time_dimensions(value):
     text = _known(value).casefold()
     result = {}
     for key, pattern in (
-        ('era', r'thế kỷ\s*\d+|tiền sử|hiện đại|cổ đại'),
+        ('era', r'thế kỷ\s*\d+|tiền sử|hiện đại|hiện tại|cổ đại'),
         ('day', r'ngày hôm sau|hôm sau|hôm trước|cùng ngày'),
         ('daylight', r'ban ngày|ban đêm|đêm'),
         ('dayperiod', r'buổi sáng|buổi trưa|buổi chiều|buổi tối|hoàng hôn|bình minh')):
         match = re.search(pattern, text)
         if match:
-            result[key] = match.group().replace('ngày hôm sau', 'hôm sau').replace('ban đêm', 'đêm')
+            result[key] = match.group().replace('ngày hôm sau', 'hôm sau').replace('ban đêm', 'đêm').replace('hiện tại', 'hiện đại')
     return result
 
 
@@ -151,12 +152,12 @@ def _contract(previous, current, first=False):
     # Confirmed planner relations take precedence.  Context comparisons are
     # only used when the planner did not identify a non-continuation relation.
     if relation in (None, 'continuation'):
-        if previous_location and current_location and previous_location.casefold() != current_location.casefold():
-            relation, confidence = 'location_change', 0.85
-            basis.append('confirmed_location_change')
-        elif confirmed_time_change(previous_time, current_time):
+        if confirmed_time_change(previous_time, current_time):
             relation, confidence = 'time_jump', 0.82
             basis.append('confirmed_time_context_change')
+        elif previous_location and current_location and previous_location.casefold() != current_location.casefold():
+            relation, confidence = 'location_change', 0.85
+            basis.append('confirmed_location_change')
         elif same_situation or same_beat:
             relation, confidence = 'continuation', 0.8
             basis.append('same_situation' if same_situation else 'same_story_beat')
@@ -250,19 +251,62 @@ FIRST_SENTENCE_BRIDGE_RULE = (
 )
 
 
-def apply_transition_contracts(plan):
+def archive_boundary_context(previous, current, shots, facts_by_shot):
+    """Find observed details near both sides of the cut using archived shot IDs."""
+    context = {}
+    for label, event, tail in (('before', previous, True), ('after', current, False)):
+        sources = [shot for source in event.get('visual_sources') or []
+                   for shot in (source.get('shot_ids') or [source.get('shot_id')])
+                   if shot in shots]
+        if not sources:
+            continue
+        indices = [shots[shot] for shot in sources]
+        index = max(indices) if tail else min(indices)
+        nearby = (index, index + (-1 if tail else 1))
+        facts = {fact['fact_id']: fact for position in nearby
+                 for fact in facts_by_shot.get(position, [])}
+        context[label] = list(facts.values())[:4]
+    return context
+
+
+def apply_transition_contracts(plan, archive=None):
     """Attach one global, source-ordered boundary contract to every event."""
     result = copy.deepcopy(plan)
     events = [event for group in result.get('events_by_part') or [] for event in group]
+    archive = archive or {}
+    shots = {row['shot_id']: index for index, row in enumerate(archive.get('shots') or [])}
+    facts_by_shot = {}
+    for chunk in archive.get('observations') or []:
+        for source_event in chunk.get('events') or []:
+            for fact in source_event.get('grounded_facts') or []:
+                if fact.get('status', 'confirmed') != 'confirmed' or not fact.get('text'):
+                    continue
+                for shot in fact.get('shot_ids') or []:
+                    if shot in shots:
+                        facts_by_shot.setdefault(shots[shot], []).append({
+                            key: fact[key] for key in
+                            ('fact_id', 'text', 'shot_ids', 'evidence_kind', 'spoken_text')
+                            if key in fact})
     previous = None
     actor_states = {}
     for event in events:
         contract = _contract(previous, event, first=previous is None)
+        if previous and event.get('event_cluster_writer_version') == 2:
+            contract['requires_bridge'] = True
+            contract['previous_boundary'] = boundary_state(previous, tail=True)
+            contract['current_boundary'] = boundary_state(event)
+            slots = event.get('sentence_slots') or []
+            if slots:
+                contract['bridge_unit_id'] = slots[0]['unit_id']
         # A returning storyline can be separated by many unrelated scenes.
         # Keep source states, not an invented narrative recap of the gap.
         contract['returning_actor_states'] = {
             actor: copy.deepcopy(actor_states[actor]) for actor in _characters(event)
             if actor in actor_states and actor_states[actor]['event_id'] != (previous or {}).get('event_id')}
+        if previous and contract['relation'] in ('location_change', 'neutral_reintroduction'):
+            nearby = archive_boundary_context(previous, event, shots, facts_by_shot)
+            if any(nearby.values()):
+                contract['archive_boundary_context'] = nearby
         event['transition_contract'] = contract
         event['transition_contract_version'] = VERSION
         slots = event.get('sentence_slots') or []

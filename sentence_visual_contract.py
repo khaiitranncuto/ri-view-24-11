@@ -134,8 +134,15 @@ def inspect_sentence_visual_contract(payload, target, duration=None, *, require_
         fallback_ids = {s.get('scene_id') or s.get('event_id') for s in scenes if s.get('visual_fallback')}
         recoverable = {'UNVERIFIED_VISUAL', 'CONTENT_AUDIT_NOT_PASSED',
                        'SOURCE_SIGNATURE_INVALID', 'SENTENCE_VISUAL_UNRELATED'}
+        continuing_ids = {s.get('scene_id') or s.get('event_id') for s in scenes
+                          if s.get('continue_on_content_error') and s.get('visual_fallback')}
+        quality_codes = {'DUPLICATE_NARRATION', 'NARRATION_FLOW_CONFLICT'}
+        quality_warnings = [r for r in issues if r.get('scene_id') in continuing_ids
+                            and r['code'] in quality_codes]
+        issues = [r for r in issues if r not in quality_warnings]
         warnings = [r for r in issues if r.get('scene_id') in fallback_ids and r['code'] in recoverable]
         issues = [r for r in issues if r not in warnings]
+        warnings.extend(quality_warnings)
     return dict(passed=not issues, target=int(target), actual=total,
                 linked_sentence_count=sum(r['passed'] for r in sentences_report),
                 sentences=sentences_report, issues=issues, warnings=warnings)

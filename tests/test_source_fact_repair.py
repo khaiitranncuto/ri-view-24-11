@@ -8,6 +8,50 @@ from source_fact_repair import reviewed_event, coherent_repair_context, review_p
 
 
 class SourceFactRepairTests(unittest.TestCase):
+    def test_actor_correction_removes_wrong_prisoner_and_stale_writer_task(self):
+        event = self.event()
+        event['characters'] = ['P01', 'P02']
+        event['observed_facts'][0].update(text='Nobita và Doraemon bị trói.', actor_ids=['P01', 'P02'])
+        event['sentence_slots'][0]['narrative_task'] = dict(purpose='Nobita bị bắt.')
+        registry = [dict(id='P01', name='Nobita'), dict(id='P02', name='Doraemon')]
+        result = reviewed_event(event, dict(facts=[dict(fact_id='F1', status='confirmed',
+            text='Doraemon bị trói trong nhà tù.', actor_ids=['P02'])]), registry)
+        self.assertEqual(result['characters'], ['P02'])
+        self.assertNotIn('Nobita', result['identity_contract']['visible_names'])
+        self.assertEqual(result['observed_facts'][0]['canonical_actor_ids'], ['P02'])
+        self.assertNotIn('Nobita', result['sentence_slots'][0]['narrative_task']['purpose'])
+        self.assertEqual(event['characters'], ['P01', 'P02'])
+
+    def test_actor_review_requires_known_ids_and_accepts_neutral_group(self):
+        registry = [dict(id='P01', name='Nobita')]
+        for actors in (['UNKNOWN'], 'P01'):
+            with self.assertRaisesRegex(ValueError, 'ACTORS_INVALID'):
+                reviewed_event(self.event(), dict(facts=[dict(fact_id='F1', status='confirmed',
+                    text='Nhóm bạn bị trói trong tù.', actor_ids=actors)]), registry)
+        result = reviewed_event(self.event(), dict(facts=[dict(fact_id='F1', status='confirmed',
+            text='Nhóm bạn bị trói trong tù.', actor_ids=[])]), registry)
+        self.assertEqual(result['characters'], [])
+
+    def test_old_candidate_gets_corrected_evidence_without_changing_its_words(self):
+        from source_fact_repair import refresh_reviewed_sources, source_review_key
+        event = self.event()
+        revised = reviewed_event(event, dict(facts=[dict(fact_id='F1', status='confirmed',
+            text='Bố Nobita rời khỏi nhà.')]))
+        payload = dict(parts=[dict(scenes=[dict(scene_id=event['scene_id'],
+            tts='Bố Nobita về nhà.', observed_facts=event['observed_facts']),
+            dict(scene_id='OTHER', tts='Mẹ đứng chờ.')])])
+        result = refresh_reviewed_sources(payload, [revised])
+        self.assertEqual(result['parts'][0]['scenes'][0]['tts'], 'Bố Nobita về nhà.')
+        self.assertEqual(result['parts'][0]['scenes'][0]['observed_facts'][0]['text'], 'Bố Nobita rời khỏi nhà.')
+        self.assertEqual(result['parts'][0]['scenes'][1], payload['parts'][0]['scenes'][1])
+        self.assertNotEqual(source_review_key(event, 'film'), source_review_key(revised, 'film'))
+
+    def test_valid_scenes_and_unresolved_audits_do_not_trigger_source_review(self):
+        from source_fact_repair import needs_source_review
+        for state in ('grounding_audit_passed', 'grounding_audit_pending'):
+            self.assertFalse(needs_source_review({state: True,
+                'visual_alignment_errors': ['unsupported_narration:transition_state_conflict:']}))
+
     def event(self):
         return dict(event_id='E0085', scene_id='S0085', sentence_quota=1,
             event='Bố Nobita về nhà.', narration_focus='Bố Nobita về nhà.',
@@ -63,14 +107,20 @@ class SourceFactRepairTests(unittest.TestCase):
         self.assertIn('status=unclear', prompt)
 
     def test_app_reviews_rewrites_and_rechecks_only_rejected_scene(self):
+        self.check_app_review('video')
+
+    def test_text_transition_rejection_triggers_source_review_and_preserves_good_scene(self):
+        self.check_app_review('text')
+
+    def check_app_review(self, method):
         from tests.test_visual_audit_diagnostics import VisualAuditDiagnosticTests
         reviewer = Mock(return_value=json.dumps({'facts': [dict(
             fact_id='F1', status='confirmed', text='Bố Nobita rời khỏi nhà.')]}))
         audit, payload, logs = VisualAuditDiagnosticTests().app_auditor(reviewer)
         event = self.event()
         bad = dict(event, tts='Bố Nobita về nhà.', evidence_sentence_plan_version=1,
-                   grounding_audit_method='video', grounding_audit_pending=False,
-                   grounding_audit_passed=False, visual_alignment_errors=['unsupported_narration:sai hướng'])
+                   grounding_audit_method=method, grounding_audit_pending=False,
+                   grounding_audit_passed=False, visual_alignment_errors=['unsupported_narration:transition_state_conflict:sai nhân vật'])
         good = dict(bad, scene_id='S0084', event_id='E0084', tts='Mẹ đứng chờ.',
                     grounding_audit_passed=True, visual_alignment_errors=[])
         payload = {'parts': [{'part': 1, 'scenes': [good, bad]}]}

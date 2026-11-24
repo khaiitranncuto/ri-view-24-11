@@ -7,6 +7,13 @@ from transition_contract import apply_transition_contracts
 
 
 class TransitionContractTests(unittest.TestCase):
+    def test_era_change_takes_priority_when_location_also_changes(self):
+        _, current = self.contracts(
+            self.event('E1', scene_context={'location': 'Đồng cỏ', 'time_context': 'Thời tiền sử'}),
+            self.event('E2', temporal_relation='continuation',
+                       scene_context={'location': 'Nhà Nobita', 'time_context': 'Hiện tại'}))
+        self.assertEqual(current['transition_contract']['relation'], 'time_jump')
+
     def test_boundary_verifier_receives_previous_scene_across_parts(self):
         first = dict(scene_id='S1', tts='Kukuru bắt được cá.',
                      observed_facts=[{'text': 'Kukuru bắt cá.'}], grounded_plan_locked=True)
@@ -75,6 +82,28 @@ class TransitionContractTests(unittest.TestCase):
         contract = current['transition_contract']
         self.assertEqual(contract['relation'], 'neutral_reintroduction')
         self.assertEqual(contract['wording_policy'], 'neutral_current_anchor_only')
+
+    def test_cross_part_boundary_uses_archived_observations_and_lookahead(self):
+        from coherent_recap import upcoming_story_context
+
+        first = self.event('E1', visual_sources=[{'shot_id': 'SH1'}])
+        second = self.event('E2', visual_sources=[{'shot_id': 'SH2'}])
+        archive = {
+            'shots': [{'shot_id': 'SH1'}, {'shot_id': 'SH2'}],
+            'observations': [{'events': [{'grounded_facts': [
+                {'fact_id': 'F1', 'text': 'The character looks down.', 'shot_ids': ['SH1']},
+                {'fact_id': 'F2', 'text': 'Trees shake.', 'shot_ids': ['SH2']},
+                {'fact_id': 'F3', 'text': 'The character may have landed.',
+                 'shot_ids': ['SH2'], 'status': 'uncertain'},
+            ]}]}],
+        }
+        plan = apply_transition_contracts({'events_by_part': [[first], [second]]}, archive)
+        contract = plan['events_by_part'][1][0]['transition_contract']
+        nearby = contract['archive_boundary_context']
+        self.assertEqual([fact['fact_id'] for fact in nearby['before']], ['F1'])
+        self.assertEqual([fact['fact_id'] for fact in nearby['after']], ['F2'])
+        self.assertEqual(contract['relation'], 'neutral_reintroduction')
+        self.assertEqual(upcoming_story_context(plan)['E1'][0]['event_id'], 'E2')
 
     def test_explicit_dependency_allows_consequence_not_a_phrase_template(self):
         _, current = self.contracts(

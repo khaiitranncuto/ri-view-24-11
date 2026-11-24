@@ -238,6 +238,30 @@ class ParagraphNarrationTests(unittest.TestCase):
                              candidates=checkpoints[-1])
         self.assertEqual(cached, rows)
 
+    def test_provider_failure_keeps_successful_sibling_for_resume(self):
+        events = planned([event(1), event(2)])
+        checkpoint = []
+
+        def generate(requested, prompt):
+            if any(e['event_id'] == 'E0001' for e in requested):
+                raise RuntimeError('503 UNAVAILABLE')
+            return json.dumps(response(requested), ensure_ascii=False)
+
+        with self.assertRaisesRegex(ValueError, 'WRITER_PROVIDER_PENDING:E0001'):
+            write_batch(events, {}, generate, fast_mode=True,
+                        capacity_error=lambda exc: '503' in str(exc),
+                        save=lambda state: checkpoint.append(copy.deepcopy(state)))
+
+        resumed = []
+
+        def retry(requested, prompt):
+            resumed.extend(e['event_id'] for e in requested)
+            return json.dumps(response(requested), ensure_ascii=False)
+
+        rows = write_batch(events, {}, retry, candidates=checkpoint[-1], fast_mode=True)
+        self.assertEqual(resumed, ['E0001'])
+        self.assertEqual([row['event_id'] for row in rows], ['E0001', 'E0002'])
+
     def test_paragraph_proofs_survive_coercion_targeted_repair_merge_and_normalization(self):
         responses = []
         for part in (1, 2, 3):

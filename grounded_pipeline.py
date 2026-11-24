@@ -41,9 +41,12 @@ def observation_response_schema():
                      'match_confidence', 'name_evidence', 'identity_evidence']}
     observation = {'type': 'object', 'properties': {'text': string, 'shot_ids': strings, 'actor_ids': strings,
         'story_beat_ids': strings,
+        'key_moments': {'type': 'array', 'maxItems': 3, 'items': {'type': 'object',
+            'properties': {'shot_id': string, 'offset_seconds': {'type': 'number'}},
+            'required': ['shot_id', 'offset_seconds']}},
         'evidence_kind': {'type': 'string', 'enum': ['visual']},
         'status': {'type': 'string', 'enum': ['confirmed', 'uncertain']}},
-        'required': ['text', 'shot_ids', 'actor_ids', 'evidence_kind', 'status']}
+        'required': ['text', 'shot_ids', 'actor_ids', 'evidence_kind', 'status', 'key_moments']}
     event = {'type': 'object', 'properties': {
         **{k: string for k in ('local_event_id', 'situation_id', 'event', 'sequence_type', 'story_role')},
         'content_kind': {'type': 'string', 'enum': ['story', 'non_story']},
@@ -165,7 +168,8 @@ def non_story(text):
         r'opening montage|intro montage|opening sequence|title sequence|'
         r'opening song|theme song|nhac mo dau|bai hat mo dau|'
         r'doan gioi thieu nhan vat|montage gioi thieu|phim gioi thieu|'
-        r'danh sach doan lam phim|bieu tuong hang phim)\b', text))
+        r'danh sach doan lam phim|bieu tuong hang phim|quang cao chen giua|'
+        r'doan tai tro|trailer gioi thieu phim)\b', text))
 
 
 def observation_prompt(chunk, start, end, desired_facts, context=None):
@@ -180,7 +184,7 @@ def observation_prompt(chunk, start, end, desired_facts, context=None):
         'Nguoi trong observation phai tham chieu bang [CHAR=C1] (ID trong characters), '
         'kem actor_ids; KHONG chep ten rieng vao text de backend phai tim-thay chu. '
         'Neu chi nhac den nguoi khac trong loi thoai, khong gan nguoi do thanh actor dang hien tren hinh. '
-        'Ghi ro chu the, hanh dong cu the va doi tuong khi thuc su nhin thay. '
+        'Ghi ro ai lam gi voi doi tuong nao; doi chieu mat va dac diem rieng khi nhan vat doi do. '
         'Khong nang "dung truoc cua" thanh "mo cua", khong bien bieu cam thanh noi tam. '
         'Moi observation co evidence_kind="visual", status="confirmed" chi khi hinh '
         'chung minh; chua ro ghi status="uncertain" va ly do trong review_candidates. '
@@ -192,10 +196,15 @@ def observation_prompt(chunk, start, end, desired_facts, context=None):
         'Neu co mat xich trong outline chua tim thay hoac chi ho tro duoc mot phan, '
         'ghi plot_gaps gom beat_id, reason va shot_ids vung can doi chieu; '
         'khong danh dau thieu chi vi ket qua nam ngoai clip hien tai. '
-        f'Co gang ghi khoang {desired_facts} du kien khac nhau tren TOAN BO clip, khong chi dau clip. '
+        f'Moc tham khao {desired_facts} y ke co bang chung tren TOAN BO clip, khong chi dau clip. '
+        'Ngay luot nay, chon cum hinh de dung cho tung dien bien. Chi giu shot de thay '
+        'nguyen nhan, hanh dong chinh, thay doi hoac ket qua; luoc dong tac lap khong them y. '
+        'Moi observation tra key_moments (toi da 3): shot_id va offset tu dau shot (0-den-duoi-6s). '
+        'Ghi khung chung minh ket qua, roi moc bat dau/tac dong neu can. [] khi chua thay ro. '
         'So luong la muc tieu tim bang chung, khong duoc bia, lap cam xuc hay doan frame de du so. '
-        'Quan sat CHI TIET TUNG SU KIEN: ghi rieng hanh dong bat dau, cac thao tac noi tiep, '
-        'tro ngai nhin thay, phan ung cu the cua nhan vat va ket qua xuat hien tren hinh. '
+        'Giu moi buoc ngoat: moi de doa lo dien, phan don, ket qua, moi nguy quay lai. '
+        'Chi tach thao tac hay phan ung thanh du kien rieng khi no doi tinh the '
+        'hoac giup nguoi xem hieu dien bien tiep theo. '
         'Moi su kien co the gom 1-8 hoac nhieu hon du kien neu that su co dien bien moi, '
         'bang tieng Viet va theo thu tu quan sat. Khong chia mot hanh dong thanh cac cau dong nghia. '
         'Giu nguyen nhan-hanh dong-ket qua; danh dau hanh dong dang tiep dien qua bien clip. '
@@ -206,15 +215,16 @@ def observation_prompt(chunk, start, end, desired_facts, context=None):
         'Gan situation_id on dinh cho cung tinh huong trong clip; khong tao event de du so cau. '
         'Moi tinh huong ghi scene_context gom location, time_context, goal; '
         'hai tuyen khac dia diem/nhan vat phai dung situation_id khac du cung chu de bo nha di. '
-        'Chi dung shot_ids THUC SU DOC DUOC tren hinh. KHONG tu viet timestamp. '
+        'Chi dung shot_ids THUC SU DOC DUOC tren hinh. Khong tra timestamp tuyet doi; '
+        'chi duoc uoc luong offset trong shot cua khoanh khac nhin thay. '
         'Neu khong ro ID hoac khong chac hanh dong, de vao review_candidates, khong tao observation. '
-        'Logo, credits, title card, outro khong phai du kien cot truyen; danh dau content_kind="non_story" va bo. '
+        'Logo, credits, outro, trailer va quang cao chen phim: danh dau content_kind="non_story". '
         'Ca doan nhac mo dau/opening, montage gioi thieu nhan vat, canh nhan vat tao dang, '
         'bay luon hoac sinh vat xuat hien trong intro deu la non_story, DU khong co chu tren hinh. '
         'Khong ke cac canh intro nhu su kien dang xay ra, khong ghep chung voi canh cot truyen. '
         'Neu mot shot vua co title/logo toan man hinh vua co cot truyen, bo shot tron do; '
         'chi lay shot cot truyen sach tiep theo. Logo kenh nho o goc (watermark) '
-        'khong tu no bien canh cot truyen thanh intro. Canh mo phim co dien bien that van la story. '
+        'khong bien canh thanh intro. Giu dien bien that, bo loi nhac ra khoi bang chung. '
         'non_story_ranges trong context CHI LA GOI Y CUA BAN TONG QUAN, co the sai. '
         'Xem TOAN BO clip ke ca vung do; tu xac dinh ranh gioi story/non_story bang nhan SHOT. '
         'Khong mac dinh vai phut dau la opening. Giu cold open, gioi thieu boi canh, '
@@ -396,6 +406,20 @@ def bind_observations(payload, catalog, start, end, chunk_number):
             fid = f'F{chunk_number:03d}_{event_number:04d}_{index:02d}'
             fact = {'fact_id': fid, 'text': text, 'shot_ids': ids,
                     'raw_text': observation['text']}
+            anchors = set()
+            moments = observation.get('key_moments')
+            for moment in (moments[:3] if isinstance(moments, list) else []):
+                if not isinstance(moment, dict):
+                    continue
+                moment_id = canonical_shot_id(moment.get('shot_id'), catalog)
+                shot = next((s for s in shots if s['shot_id'] == moment_id), None)
+                offset = moment.get('offset_seconds')
+                if shot is not None and type(offset) in (float, int) and math.isfinite(offset):
+                    point = shot['start_seconds'] + offset
+                    if max(start, shot['start_seconds']) <= point < min(end, shot['end_seconds']):
+                        anchors.add(point)
+            if anchors:
+                fact['visual_anchor_seconds'] = sorted(anchors)
             if isinstance(observation.get('story_beat_ids'), list):
                 fact['story_beat_ids'] = list(dict.fromkeys(v for v in observation['story_beat_ids']
                                                           if isinstance(v, str) and re.fullmatch(r'GB\d+', v)))
@@ -467,7 +491,7 @@ def grounded_detail(cluster, events):
 
 
 def deduplicate_observations(chunks):
-    result, seen, seen_ids, removed = copy.deepcopy(chunks), set(), set(), 0
+    result, seen, seen_ids, removed = copy.deepcopy(chunks), {}, set(), 0
     for chunk in result:
         kept = []
         for event in chunk.get('events') or []:
@@ -475,10 +499,15 @@ def deduplicate_observations(chunks):
             for fact in event.get('grounded_facts') or []:
                 key = (' '.join(fact['text'].casefold().split()), tuple(sorted(fact['shot_ids'])))
                 ids = set(fact.get('constituent_fact_ids') or [fact['fact_id']])
+                if key in seen:
+                    anchors = set(seen[key].get('visual_anchor_seconds', []))
+                    anchors.update(fact.get('visual_anchor_seconds', []))
+                    if anchors:
+                        seen[key]['visual_anchor_seconds'] = sorted(anchors)
                 if key in seen or ids <= seen_ids:
                     removed += 1
                     continue
-                seen.add(key)
+                seen[key] = fact
                 seen_ids.update(ids)
                 facts.append(fact)
             if facts:
@@ -515,6 +544,9 @@ def deduplicate_observations(chunks):
         owner, first = entries[indexes[0]]
         first['text'] = ' '.join(dict.fromkeys(entries[i][1]['text'] for i in indexes))
         first['shot_ids'] = sorted({sid for i in indexes for sid in entries[i][1]['shot_ids']})
+        anchors = sorted({point for i in indexes for point in entries[i][1].get('visual_anchor_seconds', [])})
+        if anchors:
+            first['visual_anchor_seconds'] = anchors
         first['constituent_fact_ids'] = sorted({fid for i in indexes for fid in
             (entries[i][1].get('constituent_fact_ids') or [entries[i][1]['fact_id']])})
         for index in indexes[1:]:
@@ -921,6 +953,20 @@ def apply_local_visual_fallbacks(payload, log=None):
                 from source_grounded_writer import is_source_grounded
                 if not is_source_grounded(scene):
                     raise ValueError('SOURCE_WRITER_LOCK_CHANGED: loi/hinh da doi sau khi chot')
+                if (scene.get('narration_unit_version') and not scene.get('grounding_audit_passed')
+                        and scene.get('locked_visual_shots')):
+                    shots = scene['locked_visual_shots']
+                    report = dict(scene_id=scene.get('scene_id'), part=part.get('part'),
+                        status='approximate_unverified', tts=scene.get('tts'),
+                        reasons=list(scene.get('visual_alignment_errors') or ['missing_valid_verdict']),
+                        shot_ids=[sid for shot in shots for sid in
+                                  (shot.get('shot_ids') or [shot.get('shot_id')]) if sid],
+                        start=shots[0]['start'], end=shots[-1]['end'],
+                        scope_seconds=[_time_seconds(shots[0]['start']), _time_seconds(shots[-1]['end'])],
+                        selection_method='locked_source_evidence')
+                    scene['visual_fallback'] = report
+                    if log:
+                        log(report)
                 # The writer already bound each claim to observed footage.
                 # A heuristic fallback must never replace that sealed proof.
                 continue

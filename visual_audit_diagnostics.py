@@ -97,13 +97,18 @@ def inspect_audit_response(response, expected_ids):
 
 def summarize_audit_scenes(payload):
     """Keep missing replies, rejected content, and approximate images separate."""
-    scenes = [s for p in payload.get('parts') or [] for s in p.get('scenes') or []
-              if s.get('grounded_plan_locked')]
+    from narrative_contract import sentence_texts
+    all_scenes = [s for p in payload.get('parts') or [] for s in p.get('scenes') or []]
+    scenes = [s for s in all_scenes if s.get('grounded_plan_locked')]
     return {
         'total': len(scenes),
+        'scene_count': len(all_scenes),
+        'sentence_count': sum(len(s.get('sentence_proofs') or [])
+                              if s.get('narration_unit_version')
+                              else len(sentence_texts(s.get('tts') or '')) for s in all_scenes),
         'passed_ids': [s['scene_id'] for s in scenes if s.get('grounding_audit_passed')],
         'pending_ids': [s['scene_id'] for s in scenes if s.get('grounding_audit_pending')],
         'rejected_ids': [s['scene_id'] for s in scenes
                          if not s.get('grounding_audit_passed') and not s.get('grounding_audit_pending')],
-        'fallback_ids': [s['scene_id'] for s in scenes if s.get('visual_fallback')],
+        'fallback_ids': [s['scene_id'] for s in all_scenes if s.get('visual_fallback')],
     }

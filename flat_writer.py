@@ -14,8 +14,8 @@ def writer_format():
             value = json.loads(Path(__file__).with_name('recap_writer_config.json').read_text(encoding='utf-8'))['format']
         except (OSError, ValueError, KeyError, TypeError):
             value = 'legacy'
-    if value not in ('flat', 'legacy'):
-        raise ValueError('RECAP_WRITER_FORMAT must be flat or legacy')
+    if value not in ('whole_film', 'flat', 'legacy'):
+        raise ValueError('RECAP_WRITER_FORMAT must be whole_film, flat or legacy')
     return value
 
 

@@ -5,11 +5,58 @@ only collapse identical facts in one continuous situation or shared footage.
 They never invent replacement footage or reduce the requested sentence count.
 """
 import copy
+import json
 import re
+import threading
 import unicodedata
+from urllib.request import Request, urlopen
 
 
 VERSION = 1
+_ollama_review_lock = threading.Lock()
+
+
+def review_duplicates_with_ollama(prompt, schema):
+    """Run a bounded text-only review on the local Ollama server."""
+    instructions, raw_batch = prompt.split('\n', 1)
+    batch = json.loads(raw_batch)
+    # The caller checks actors and source context before accepting any pair.
+    batch['facts'] = [
+        {key: fact[key] for key in ('fact_id', 'text', 'event_id', 'start', 'end')}
+        for fact in batch['facts']
+    ]
+    prompt = instructions + '\n' + json.dumps(batch, ensure_ascii=False, separators=(',', ':'))
+    if len(prompt.encode('utf-8')) > 8000:
+        raise ValueError('Ollama duplicate review batch exceeds the local input limit')
+    request = Request(
+        'http://127.0.0.1:11434/api/generate',
+        data=json.dumps({
+            'model': 'qwen3:4b',
+            'prompt': prompt,
+            'format': schema,
+            'stream': False,
+            'think': False,
+            'keep_alive': 0,
+            'options': {'num_ctx': 4096, 'num_predict': 1024, 'temperature': 0},
+        }).encode('utf-8'),
+        headers={'Content-Type': 'application/json'},
+    )
+    with _ollama_review_lock:
+        with urlopen(request, timeout=60) as response:
+            payload = json.load(response)
+    if payload.get('done_reason') != 'stop':
+        raise ValueError('Ollama duplicate review did not finish')
+    result = json.loads(payload['response'])
+    if not isinstance(result, dict) or not isinstance(result.get('duplicates'), list):
+        raise ValueError('Invalid Ollama duplicate review')
+    for pair in result['duplicates']:
+        if (not isinstance(pair, dict)
+                or not isinstance(pair.get('fact_id'), str)
+                or not isinstance(pair.get('retained_fact_id'), str)
+                or pair.get('same_occurrence') is not True
+                or pair.get('adds_information') is not False):
+            raise ValueError('Invalid Ollama duplicate pair')
+    return result
 
 
 def normalized(text):
@@ -102,23 +149,52 @@ def review_plan_novelty(plan, generate):
     """
     from evidence_writer import supported_facts
     from transition_contract import confirmed_time_change
-    import json
     records = []
+    protected_events = {
+        event_id for event_ids in (plan.get('editorial_anchors') or {}).values()
+        for event_id in event_ids
+    }
     for group in plan.get('events_by_part') or []:
         for event in group:
+            if event.get('editorial_anchor_role'):
+                protected_events.add(event['event_id'])
             for fact in supported_facts(event):
                 records.append(dict(fact_id=fact['fact_id'], text=fact['text'],
                     actor_ids=fact.get('canonical_actor_ids') or fact.get('actor_ids') or [],
                     evidence_kind=fact.get('evidence_kind', 'visual'),
                     event_id=event['event_id'], context=event.get('scene_context') or {},
                     start=float(event.get('start_seconds', 0)), end=float(event.get('end_seconds', 0))))
-    known = {r['fact_id']: (i, r) for i, r in enumerate(records)}
+    order = {record['fact_id']: index for index, record in enumerate(records)}
+    remaining_by_event = {}
+    for record in records:
+        event_id = record['event_id']
+        remaining_by_event[event_id] = remaining_by_event.get(event_id, 0) + 1
+    min_facts = plan.get('required_sentence_count') or 0
+
+    def eligible(left, right):
+        a, b = left['context'], right['context']
+        return (right['start'] - left['end'] <= 60
+                and left['evidence_kind'] == right['evidence_kind']
+                and sorted(left['actor_ids']) == sorted(right['actor_ids'])
+                and not (a.get('location') and b.get('location')
+                         and normalized(a['location']) != normalized(b['location']))
+                and not confirmed_time_change(a.get('time_context'), b.get('time_context')))
+
     pairs = {}
     for offset in range(0, len(records), 48):
         current = records[offset:offset + 48]
         cards = records[max(0, offset - 12):offset] + current
-        if len(cards) < 2:
+        candidates = {}
+        for right in current:
+            fid = right['fact_id']
+            index = order[fid]
+            retained_ids = {left['fact_id'] for left in cards
+                            if order[left['fact_id']] < index and eligible(left, right)}
+            if retained_ids:
+                candidates[fid] = retained_ids
+        if not candidates:
             continue
+        needed_ids = set(candidates).union(*candidates.values())
         prompt = (
             'Kiem tra TRUNG DIEN BIEN truoc khi phan bo so cau. Chi danh dau mot fact '
             'neu TOAN BO thong tin cua no da duoc fact truoc ke, cung mot lan xay ra. '
@@ -128,34 +204,35 @@ def review_plan_novelty(plan, generate):
             'Neu khong chac thi giu. Chi tra duplicates voi fact_id, retained_fact_id, '
             'same_occurrence=true, adds_information=false. retained_fact_id phai xuat hien '
             'TRUOC fact_id trong danh sach. Chi xet fact_id thuoc target_ids.\n'
-            + json.dumps(dict(target_ids=[r['fact_id'] for r in current], facts=cards), ensure_ascii=False))
+            + json.dumps(dict(target_ids=list(candidates),
+                              facts=[r for r in cards if r['fact_id'] in needed_ids]),
+                         ensure_ascii=False, separators=(',', ':')))
         response = generate(prompt)
         if isinstance(response, str):
             from recap_visual_media import parse_writing_response
             response = parse_writing_response(response)
         if not isinstance(response, dict) or not isinstance(response.get('duplicates'), list):
             raise ValueError('NARRATION_NOVELTY_REVIEW_INVALID')
-        targets = {r['fact_id'] for r in current}
-        available = {r['fact_id'] for r in cards}
+        local = response.get('_ollama_review') is True
+        if local and any(pair['retained_fact_id'] not in candidates.get(pair['fact_id'], ())
+                         for pair in response['duplicates']):
+            continue
         for pair in response['duplicates']:
             if not isinstance(pair, dict):
                 raise ValueError('NARRATION_NOVELTY_REVIEW_INVALID')
             fid, retained = pair.get('fact_id'), pair.get('retained_fact_id')
-            if (fid not in targets or retained not in available or fid == retained
+            if local and fid in order:
+                event_id = records[order[fid]]['event_id']
+                if (event_id in protected_events or remaining_by_event[event_id] <= 1
+                        or len(records) - len(pairs) <= min_facts):
+                    continue
+            if (retained not in candidates.get(fid, ())
                     or pair.get('same_occurrence') is not True or pair.get('adds_information') is not False):
-                continue
-            i, right = known[fid]
-            j, left = known[retained]
-            a, b = left['context'], right['context']
-            if (j >= i or right['start'] - left['end'] > 60
-                    or left['evidence_kind'] != right['evidence_kind']
-                    or sorted(left['actor_ids']) != sorted(right['actor_ids'])
-                    or (a.get('location') and b.get('location')
-                        and normalized(a['location']) != normalized(b['location']))
-                    or confirmed_time_change(a.get('time_context'), b.get('time_context'))):
                 continue
             while retained in pairs:
                 retained = pairs[retained]
+            if fid not in pairs:
+                remaining_by_event[records[order[fid]]['event_id']] -= 1
             pairs[fid] = retained
     return deduplicate_plan(plan, pairs.items())
 

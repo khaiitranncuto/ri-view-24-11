@@ -971,6 +971,8 @@ async def _recover_failed_tts_groups(
                     request_pacer=request_pacer,
                 )
                 recovered.append(result)
+                if recovered_fn:
+                    recovered_fn()
                 if log_fn:
                     log_fn(
                         "SUCCESS",
@@ -1353,8 +1355,8 @@ def generate_all_tts(
                 _recover_failed_tts_groups(
                     failed_groups, rate, temp_dir, ffmpeg_exe, log_fn,
                     request_pacer=request_pacer,
-                    **({'recovery_delays': (0.0, 0.0, 180.0), 'split_failed': False,
-                        'recovered_fn': mark_done}
+                    **({'recovered_fn': mark_done} if progress_fn else {}),
+                    **({'recovery_delays': (0.0, 0.0, 180.0), 'split_failed': False}
                        if options.get('tts_policy') == 'bounded_v2' else {}),
                 )
             )

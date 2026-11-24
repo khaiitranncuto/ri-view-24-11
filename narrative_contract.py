@@ -71,6 +71,14 @@ def constrain_repair_sentences(text, quota):
     return result
 
 
+class SentenceEvidenceShortage(ValueError):
+    def __init__(self, target_count, capacity):
+        self.capacity = capacity
+        super().__init__(
+            f'SENTENCE_EVIDENCE_SHORTAGE: cần {target_count} câu, '
+            f'dữ kiện chỉ hỗ trợ tối đa {capacity}; không giảm mục tiêu.')
+
+
 def allocate_sentences(plan, target_count, target_words):
     result = copy.deepcopy(plan)
     rows = [e for part in result['events_by_part'] for e in part]
@@ -117,8 +125,9 @@ def allocate_sentences(plan, target_count, target_words):
         # doing so previously turned a 281-sentence request into 188 sentences
         # while still reporting a successful duration contract.
         target_words = int(target_words)
-    if sum(capacities) < target_count:
-        raise ValueError(f'SENTENCE_EVIDENCE_SHORTAGE: cần {target_count} câu, dữ kiện chỉ hỗ trợ tối đa {sum(capacities)}; không giảm mục tiêu.')
+    evidence_capacity = sum(capacities)
+    if evidence_capacity < target_count:
+        raise SentenceEvidenceShortage(target_count, evidence_capacity)
     weights = [(max(1, footage[i] / 6) if footage else max(1, len(e.get('observed_facts') or []))) *
                (1.5 if e.get('story_role') == 'climax' else 1) for i, e in enumerate(rows)]
     if result.get('situation_plan_version', 0) >= 4:
@@ -126,20 +135,58 @@ def allocate_sentences(plan, target_count, target_words):
         for event in rows:
             facts = supported_facts(event)
             detail_words = sum(words(f['text']) for f in facts)
-            importance = (1.5 if event.get('story_role') == 'climax' else
+            importance = (3.0 if event.get('story_role') == 'climax' else
                           1.25 if event.get('story_role') == 'resolution' else
                           .25 if event.get('story_role') == 'ending' else 1.0)
             # Whisper is context, not extra visual detail to spend sentence quota on.
             weights.append(importance * max(1.0, len(facts) + detail_words / 20))
+    editorial = bool(result.get('editorial_story_spine'))
+    if editorial:
+        for i, event in enumerate(rows):
+            ideas = event.get('sentence_ideas') or []
+            if ideas:
+                weights[i] = sum(idea['importance'] for idea in ideas) * (
+                    3.0 if event.get('story_role') == 'climax' else 1.0)
+    chapters = {}
+    for i, event in enumerate(rows):
+        chapters.setdefault(event.get('story_beat_id') or event['event_id'], []).append(i)
     counts = [1] * len(rows)
     for _ in range(target_count - len(rows)):
         candidates = [i for i in range(len(rows)) if counts[i] < capacities[i]]
+        if editorial:
+            eligible = [indices for indices in chapters.values()
+                        if any(i in candidates for i in indices)]
+            chapter = max(eligible, key=lambda indices:
+                sum(weights[i] for i in indices) / sum(counts[i] for i in indices))
+            candidates = [i for i in chapter if counts[i] < capacities[i]]
         i = max(candidates, key=lambda i: weights[i] / counts[i])
         counts[i] += 1
-    for row, count in zip(rows, counts):
-        row.update(sentence_quota=count, tts_target_words=count * 20,
-                   tts_min_words=count * 15, tts_max_words=count * 25)
-    result['sentence_contract'] = {'target_count': target_count, 'target_words': int(target_words)}
+    word_targets = [count * 20 for count in counts]
+    if editorial:
+        from evidence_writer import supported_facts
+        # Spend length on information-rich events, while retaining every unit.
+        detail_weights = []
+        for event, count in zip(rows, counts):
+            facts = supported_facts(event)
+            detail_weights.append(count * max(1, sum(words(f['text']) for f in facts) / max(1, len(facts))))
+        remaining_words = max(0, int(target_words) - sum(counts))
+        total_weight = sum(detail_weights)
+        fractions = [remaining_words * weight / total_weight for weight in detail_weights]
+        word_targets = [count + int(value) for count, value in zip(counts, fractions)]
+        remainder = int(target_words) - sum(word_targets)
+        for index in sorted(range(len(rows)), key=lambda i: fractions[i] - int(fractions[i]), reverse=True)[:max(0, remainder)]:
+            word_targets[index] += 1
+    for row, count, word_target in zip(rows, counts, word_targets):
+        row.update(sentence_quota=count, tts_target_words=word_target,
+                   tts_min_words=max(count, round(word_target * .75)),
+                   tts_max_words=round(word_target * 1.25))
+    result['sentence_contract'] = {'target_count': target_count, 'target_words': int(target_words),
+                                   'evidence_capacity': evidence_capacity}
+    if editorial:
+        result['sentence_contract']['chapter_budgets'] = [dict(
+            beat_id=beat, sentence_count=sum(counts[i] for i in indices),
+            event_ids=[rows[i]['event_id'] for i in indices])
+            for beat, indices in chapters.items()]
     result['scene_contract']['target_sentence_count'] = target_count
     result['scene_contract']['sentence_tolerance_met'] = True
     return result

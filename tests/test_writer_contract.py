@@ -18,8 +18,8 @@ class WriterContractTests(unittest.TestCase):
         self.assertEqual(len(result['sentences']), 2)
         self.assertTrue(all(r['event_id'] == 'E1' for r in result['sentences']))
 
-    def test_missing_extra_and_empty_units_are_rejected(self):
-        for value in ({'U1': 'One.'}, {'U1': 'One.', 'U2': 'Two.', 'U3': 'Extra.'},
+    def test_missing_and_empty_units_without_source_text_are_rejected(self):
+        for value in ({'U1': 'One.'},
                       {'U1': 'One.', 'U2': ''}):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 decode(json.dumps(value), self.events())
@@ -37,6 +37,9 @@ class WriterContractTests(unittest.TestCase):
     def test_shared_allowance_never_changes_quota(self):
         counts = {}
         events = self.events()
+        for _ in range(4):
+            reserve(events, counts, consume=False)
+        self.assertEqual(counts, {})
         for _ in range(3):
             reserve(events, counts)
         with self.assertRaisesRegex(ValueError, 'BUDGET_EXHAUSTED'):

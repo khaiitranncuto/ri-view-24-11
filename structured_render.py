@@ -72,11 +72,15 @@ def prepare_plan_inputs(plan):
     return texts, starts, ends, groups
 
 
-def strict_visual_edl(texts, durations, groups, word_cues, source_duration=None):
+def strict_visual_edl(texts, durations, groups, word_cues, source_duration=None, visual_draft_shots=None,
+                      excluded_source_shots=()):
     from tts_engine import _word_locked_beat_boundaries
+    from video_renderer import limit_to_story_footage
     if not (len(texts) == len(durations) == len(groups) == len(word_cues)):
         raise ValueError('Render mới: số đoạn lời, thời lượng và nhóm hình không khớp.')
     rows = []
+    draft_ranges = {(round(shot['start'], 2), round(shot['end'], 2))
+                    for shot in visual_draft_shots or []}
     for i, (text, duration, group) in enumerate(zip(texts, durations, groups)):
         if not group or not math.isfinite(float(duration)) or float(duration) <= 0:
             raise ValueError(f'Render mới: dữ liệu thời lượng/hình không hợp lệ ở đoạn {i + 1}.')
@@ -88,17 +92,36 @@ def strict_visual_edl(texts, durations, groups, word_cues, source_duration=None)
             raise ValueError(f'Render mới: chưa căn được mốc từ của tình huống {i + 1}; không tự đoán điểm cắt.')
         for j, shot in enumerate(group):
             length = boundaries[j + 1] - boundaries[j]
+            if (round(shot['start'], 2), round(shot['end'], 2)) in draft_ranges:
+                rows.append({'text': shot['text'], 'duration': length,
+                             'start': shot['start'], 'end': shot['end']})
+                continue
             limit = shot['end']
             if source_duration is not None:
                 following = group[j + 1:] + [s for later in groups[i + 1:] for s in later]
                 next_start = next((s['start'] for s in following if s['start'] > shot['start']), source_duration)
                 limit = min(float(source_duration), float(next_start))
+            limit = limit_to_story_footage(shot['start'], shot['end'], limit, excluded_source_shots)
             end = min(limit, max(shot['end'], shot['start'] + length))
             if length <= 0 or length > end - shot['start'] + 1 / 30:
                 raise ValueError(f'Render mới: tình huống {i + 1}, cảnh {j + 1} thiếu hình cho '
                                  f'{length:.1f}s lời đọc trước shot kế tiếp hoặc cuối video.')
             rows.append({'text': shot['text'], 'duration': length,
                          'start': shot['start'], 'end': end})
+    region_shots = [shot for shot in visual_draft_shots or [] if not shot.get('prefer_continuity')]
+    if any(shot.get('region_id') for shot in region_shots):
+        from video_renderer import build_visual_edit_plan
+        edits = build_visual_edit_plan(
+            [row['duration'] for row in rows], [row['start'] for row in rows],
+            [row['end'] for row in rows], source_duration or max(row['end'] for row in rows),
+            strict_visual_lock=True, extend_to_next_shot=True,
+            visual_draft_shots=region_shots, excluded_source_shots=excluded_source_shots)
+        for row, edit in zip(rows, edits):
+            if edit['hold_duration'] > .001:
+                raise ValueError('EVENT_REGION_FOOTAGE_SHORTAGE: can phan bo lai loi truoc khi xuat.')
+            spans = edit.get('shot_spans') or []
+            if len(spans) == 1:
+                row.update(start=spans[0][0], end=spans[0][0] + spans[0][1])
     return rows
 
 
@@ -164,7 +187,9 @@ def render_structured_video(task_id, source, bgm, volume, voice, rate, plan, opt
         if natural and len(natural) == len(durations) and any(abs(a - b) > .04 for a, b in zip(natural, durations)):
             raise ValueError('Render mới: phối âm làm đổi thời gian giọng; giữ cache để kiểm tra, không xuất lệch hình.')
         _save(audio_marker, {'complete': True})
-    edl = strict_visual_edl(texts, durations, groups, cues, source_duration=get_video_info(source)[0])
+    edl = strict_visual_edl(texts, durations, groups, cues, source_duration=get_video_info(source)[0],
+                            visual_draft_shots=options.get('visual_draft_shots'),
+                            excluded_source_shots=options.get('excluded_source_shots') or ())
     _save(work / 'audio_visual_edl.json', edl)
     from narrative_contract import sentences as count_spoken_sentences
     options['_narration_timing'] = measured_narration_timing(sum(len(count_spoken_sentences(t)) for t in texts), durations, rate,

@@ -61,6 +61,7 @@ from app import (
     split_video_into_three_parts,
     split_video_into_batches,
     split_video_into_overlapping_batches,
+    story_detail_frame_rates,
     upload_gemini_file_with_recovery,
     validate_gemini_api_key,
     wait_for_gemini_file,
@@ -86,12 +87,13 @@ class AnalysisPipelineTests(unittest.TestCase):
         task_id = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
         TASKS[task_id] = {'persistent': True, 'status': 'running', 'logs': []}
         try:
-            with patch('app.save_task_state') as save:
+            with patch('app.save_task_state') as save, patch('app.save_task_patch') as patch_state:
                 application._persist_task_if_needed(task_id)
-                self.assertEqual(save.call_count, 1)
+                self.assertEqual(patch_state.call_count, 1)
+                self.assertEqual(save.call_count, 0)
                 TASKS[task_id]['status'] = 'failed'
                 application._persist_task_if_needed(task_id)
-                self.assertEqual(save.call_count, 2)
+                self.assertEqual(save.call_count, 1)
                 self.assertEqual(save.call_args.args[1]['status'], 'failed')
         finally:
             TASKS.pop(task_id, None)
@@ -449,6 +451,21 @@ class AnalysisPipelineTests(unittest.TestCase):
             [call[call.index("-ss") + 1] for call in calls],
             ["0.000", "900.000", "1800.000"],
         )
+
+    def test_priority_story_clips_use_higher_fps_without_changing_windows(self):
+        boundaries = [0, 10, 20, 30, 40]
+        outline = {'story_beats': [
+            {'start_seconds': 11, 'end_seconds': 29, 'story_role': 'climax'},
+        ]}
+        rates = story_detail_frame_rates(boundaries, outline)
+        self.assertEqual(rates, [2, 3, 3, 2])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch('grounded_pipeline.indexed_clip') as cut:
+                windows, _ = split_video_into_overlapping_batches(
+                    'film.mp4', temp_dir, 40, boundaries, 'ffmpeg', 'detail',
+                    indexed=True, overlap_seconds=2, indexed_frame_rates=rates)
+        self.assertEqual(windows, [(0, 12), (10, 22), (20, 32), (30, 40)])
+        self.assertEqual([call.kwargs['fps'] for call in cut.call_args_list], rates)
 
     def test_video_upload_returns_ascii_filename(self):
         response = flask_app.test_client().post(

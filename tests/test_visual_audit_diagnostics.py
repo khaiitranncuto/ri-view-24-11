@@ -107,7 +107,8 @@ class VisualAuditDiagnosticTests(unittest.TestCase):
         module = ast.fix_missing_locations(ast.Module(body=[factory], type_ignores=[]))
         events = []
         fake_os = SimpleNamespace(stat=lambda path: SimpleNamespace(st_size=123, st_mtime_ns=456),
-                                  path=SimpleNamespace(realpath=lambda path: path))
+                                  path=SimpleNamespace(realpath=lambda path: path,
+                                                       basename=lambda path: Path(path).name))
         env = dict(uuid=uuid, time=time, json=json, copy=copy, traceback=traceback, os=fake_os,
             selected_model='offline-model', api_key='test-secret', video_path='source.mp4',
             append_task_log=lambda task, level, message, details='': events.append(
